@@ -203,14 +203,14 @@ window.addEventListener('DOMContentLoaded', function () {
       if (stockField && stockField.value === 'Yes') {
         e.preventDefault();
         e.stopImmediatePropagation();
-        setError(stockError, stockField, 'Sorry, this page is only available to salons that do not currently stock Schwarzkopf Professional IGORA.');
+        setError(stockError, stockField, 'Please get in touch with your Schwarzkopf Professional representative.');
         blocked = true;
       }
 
       if (brandsWrapper && !atLeastOneChecked(brandsWrapper)) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        setError(brandsError, null, 'Please select at least one brand.');
+        setError(brandsError, null, 'Please select at least one range.');
         brandsWrapper.style.outline = '1px solid red';
         blocked = true;
       }
