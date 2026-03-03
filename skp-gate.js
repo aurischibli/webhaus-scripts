@@ -160,7 +160,7 @@ window.addEventListener('DOMContentLoaded', function () {
     stockField.addEventListener('change', function() {
       clearStatus(stockError, stockField);
       if (stockField.value === 'Yes') {
-        setError(stockError, stockField, 'Sorry, this page is only available to salons that do not currently stock Schwarzkopf Professional IGORA.');
+        setError(stockError, stockField, 'Please get in touch with your Schwarzkopf Professional representative.');
       }
     });
   }
