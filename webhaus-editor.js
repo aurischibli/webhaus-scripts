@@ -49,6 +49,56 @@
   let activeElement = null
   let originalText = ''
   let editCount = 0
+  let editLog = []             // { timestamp, path, oldText, newText, oldFileContent, handle }
+
+  // ---------------------------------------------------------------------------
+  // PERSISTENT FOLDER HANDLE (IndexedDB)
+  // ---------------------------------------------------------------------------
+  // The File System Access API allows folder handles to be stored in IndexedDB.
+  // On reload we try to restore the previously granted folder for this origin —
+  // no more re-picking your project folder on every page refresh.
+
+  const IDB_NAME = 'webhaus-editor'
+  const IDB_STORE = 'handles'
+  const IDB_KEY = `folder:${location.origin}`
+
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(IDB_NAME, 1)
+      req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE)
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error)
+    })
+  }
+
+  async function idbSaveHandle(handle) {
+    try {
+      const db = await idbOpen()
+      const tx = db.transaction(IDB_STORE, 'readwrite')
+      tx.objectStore(IDB_STORE).put(handle, IDB_KEY)
+      return new Promise(res => { tx.oncomplete = () => res(); tx.onerror = () => res() })
+    } catch (_) { /* ignore */ }
+  }
+
+  async function idbLoadHandle() {
+    try {
+      const db = await idbOpen()
+      const tx = db.transaction(IDB_STORE, 'readonly')
+      const req = tx.objectStore(IDB_STORE).get(IDB_KEY)
+      return new Promise(res => {
+        req.onsuccess = () => res(req.result || null)
+        req.onerror = () => res(null)
+      })
+    } catch (_) { return null }
+  }
+
+  async function idbClearHandle() {
+    try {
+      const db = await idbOpen()
+      const tx = db.transaction(IDB_STORE, 'readwrite')
+      tx.objectStore(IDB_STORE).delete(IDB_KEY)
+    } catch (_) { /* ignore */ }
+  }
 
   // ---------------------------------------------------------------------------
   // STYLES
@@ -147,6 +197,44 @@
         background: rgba(37, 99, 235, 0.04) !important;
       }
 
+      /* Element-level feedback states */
+      [data-wh-state="saving"] {
+        position: relative;
+        outline: 2px solid #eab308 !important;
+        outline-offset: 2px;
+      }
+      [data-wh-state="saving"]::after {
+        content: '';
+        position: absolute;
+        top: 50%;
+        right: -22px;
+        width: 12px;
+        height: 12px;
+        margin-top: -6px;
+        border: 2px solid #eab308;
+        border-top-color: transparent;
+        border-radius: 50%;
+        animation: wh-spin 0.7s linear infinite;
+        z-index: 999999;
+      }
+      [data-wh-state="success"] {
+        animation: wh-pulse-success 0.7s ease-out;
+      }
+      [data-wh-state="error"] {
+        animation: wh-pulse-error 0.7s ease-out;
+      }
+      @keyframes wh-spin {
+        to { transform: rotate(360deg); }
+      }
+      @keyframes wh-pulse-success {
+        0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5); }
+        100% { box-shadow: 0 0 0 14px rgba(34, 197, 94, 0); }
+      }
+      @keyframes wh-pulse-error {
+        0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
+        100% { box-shadow: 0 0 0 14px rgba(239, 68, 68, 0); }
+      }
+
       /* Image hover overlay */
       .wh-img-overlay {
         position: absolute;
@@ -240,6 +328,84 @@
         background: rgba(255,255,255,0.08);
         color: #fff;
       }
+
+      /* Edit log panel */
+      #wh-log-panel {
+        position: fixed;
+        bottom: 64px;
+        right: 20px;
+        z-index: 999998;
+        width: 380px;
+        max-height: 320px;
+        background: #1a1a1a;
+        border-radius: 10px;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.08);
+        font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+        font-size: 12px;
+        color: #e0e0e0;
+        overflow: hidden;
+        display: none;
+      }
+      #wh-log-panel.wh-open { display: block; }
+      #wh-log-panel .wh-log-header {
+        padding: 10px 14px;
+        font-size: 12px;
+        font-weight: 600;
+        color: #fff;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      #wh-log-panel .wh-log-list {
+        overflow-y: auto;
+        max-height: 268px;
+        padding: 6px 0;
+      }
+      #wh-log-panel .wh-log-entry {
+        padding: 8px 14px;
+        border-bottom: 1px solid rgba(255,255,255,0.04);
+      }
+      #wh-log-panel .wh-log-file {
+        font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+        font-size: 11px;
+        color: #888;
+        margin-bottom: 3px;
+      }
+      #wh-log-panel .wh-log-diff {
+        font-size: 12px;
+        line-height: 1.4;
+      }
+      #wh-log-panel .wh-log-old {
+        color: #f87171;
+        text-decoration: line-through;
+      }
+      #wh-log-panel .wh-log-new {
+        color: #4ade80;
+      }
+      #wh-log-panel .wh-log-time {
+        font-size: 10px;
+        color: #555;
+        margin-top: 3px;
+      }
+      #wh-log-panel .wh-log-empty {
+        padding: 20px 14px;
+        color: #555;
+        text-align: center;
+      }
+      #wh-log-panel button.wh-undo-btn {
+        background: transparent;
+        border: 1px solid rgba(255,255,255,0.12);
+        color: #e0e0e0;
+        padding: 2px 8px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 11px;
+        font-family: inherit;
+      }
+      #wh-log-panel button.wh-undo-btn:hover {
+        background: rgba(255,255,255,0.08);
+      }
     `
     document.head.appendChild(style)
   }
@@ -282,6 +448,7 @@
   async function pickProjectFolder() {
     try {
       dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' })
+      await idbSaveHandle(dirHandle)
       fileIndex.clear()
       toast('Indexing project files…', 'info')
       await indexDirectory(dirHandle, '')
@@ -292,6 +459,75 @@
       if (err.name === 'AbortError') return false
       toast(`Error: ${err.message}`, 'error')
       return false
+    }
+  }
+
+  /**
+   * Try to restore a previously granted folder handle from IndexedDB.
+   * If permission is still granted (Chrome remembers per-origin), restore silently.
+   * If permission needs to be re-requested, show a one-click reconnect button.
+   */
+  async function tryRestoreFolder() {
+    const saved = await idbLoadHandle()
+    if (!saved) return false
+
+    try {
+      const perm = await saved.queryPermission({ mode: 'readwrite' })
+
+      if (perm === 'granted') {
+        dirHandle = saved
+        await indexDirectory(dirHandle, '')
+        updateToolbar()
+        toast(`Restored "${dirHandle.name}" — ${fileIndex.size} files`, 'success')
+        return true
+      }
+
+      if (perm === 'prompt') {
+        // Need a user gesture to re-grant — show reconnect button
+        showReconnectButton(saved)
+        return false
+      }
+
+      // Denied
+      await idbClearHandle()
+      return false
+    } catch (err) {
+      // Handle is no longer valid (folder moved/deleted)
+      await idbClearHandle()
+      return false
+    }
+  }
+
+  async function reconnectFolder(saved) {
+    try {
+      const perm = await saved.requestPermission({ mode: 'readwrite' })
+      if (perm === 'granted') {
+        dirHandle = saved
+        fileIndex.clear()
+        await indexDirectory(dirHandle, '')
+        updateToolbar()
+        toast(`Reconnected "${dirHandle.name}"`, 'success')
+        const btn = document.getElementById('wh-btn-reconnect')
+        if (btn) btn.remove()
+      } else {
+        toast('Permission denied', 'error')
+      }
+    } catch (err) {
+      toast(`Reconnect failed: ${err.message}`, 'error')
+    }
+  }
+
+  function showReconnectButton(saved) {
+    const folderBtn = document.getElementById('wh-btn-folder')
+    if (!folderBtn) return
+    folderBtn.textContent = `Reconnect "${saved.name}"`
+    folderBtn.classList.add('wh-active')
+    folderBtn.onclick = async () => {
+      folderBtn.classList.remove('wh-active')
+      folderBtn.onclick = null
+      await reconnectFolder(saved)
+      // Re-bind original handler
+      folderBtn.addEventListener('click', async () => await pickProjectFolder())
     }
   }
 
@@ -318,45 +554,148 @@
   }
 
   /**
-   * Search all indexed source files for an exact text match.
-   * Returns array of { path, handle, content, occurrences }
+   * Escape special regex characters in a string.
+   */
+  function escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  }
+
+  /**
+   * Build a regex that matches the given text with flexible whitespace AND
+   * smart-quote tolerance. Source code often has straight quotes ("hello")
+   * while DOM might render smart quotes ("hello"), or vice versa in MDX.
+   * "Welcome to Our Platform" matches "Welcome\n  to Our\n  Platform" in source.
+   */
+  function buildFlexiblePattern(text) {
+    const trimmed = text.trim()
+    if (!trimmed) return null
+
+    // Split into words, escape each for regex safety
+    const words = trimmed.split(/\s+/).filter(Boolean)
+    if (words.length === 0) return null
+
+    // Escape regex special chars, then make quote/dash characters interchangeable
+    const escapedWords = words.map(w => {
+      let escaped = escapeRegex(w)
+      // Treat any quote variant as equivalent
+      escaped = escaped.replace(/['\u2018\u2019\u201A\u201B]/g, "['\\u2018\\u2019\\u201A\\u201B]")
+      escaped = escaped.replace(/["\u201C\u201D\u201E\u201F]/g, '["\\u201C\\u201D\\u201E\\u201F]')
+      // Treat any dash/hyphen variant as equivalent
+      escaped = escaped.replace(/[\-\u2013\u2014]/g, '[\\-\\u2013\\u2014]')
+      // Treat HTML entity for & as equivalent to literal &
+      escaped = escaped.replace(/&amp;/g, '(?:&|&amp;)')
+      return escaped
+    })
+
+    // Allow any whitespace (spaces, tabs, newlines) between words
+    return new RegExp(escapedWords.join('[\\s\\n\\r]+'), 'g')
+  }
+
+  /**
+   * Search all indexed source files for text, using flexible whitespace matching.
+   * Returns array of { path, handle, content, match, occurrences }
+   * where `match` is the exact substring found in the source (preserving original whitespace).
    */
   function searchFiles(searchText) {
     const results = []
-    const needle = searchText.trim()
-    if (!needle) return results
+    const trimmed = searchText.trim()
+    if (!trimmed) return results
 
+    // Strategy 1: exact match (fastest, most precise)
     for (const [path, { handle, content }] of fileIndex) {
-      // Count occurrences in this file
-      let count = 0
-      let idx = -1
-      while ((idx = content.indexOf(needle, idx + 1)) !== -1) count++
-      if (count > 0) {
-        results.push({ path, handle, content, occurrences: count })
+      if (content.includes(trimmed)) {
+        results.push({ path, handle, content, match: trimmed, occurrences: 1 })
       }
     }
+    if (results.length > 0) return results
+
+    // Strategy 2: flexible whitespace match (handles JSX line breaks)
+    const pattern = buildFlexiblePattern(trimmed)
+    if (!pattern) return results
+
+    for (const [path, { handle, content }] of fileIndex) {
+      const matches = [...content.matchAll(pattern)]
+      if (matches.length > 0) {
+        // Store the actual matched text from the source (with original whitespace)
+        results.push({
+          path, handle, content,
+          match: matches[0][0],
+          occurrences: matches.length
+        })
+      }
+    }
+    if (results.length > 0) return results
+
+    // Strategy 3: try matching just a long-enough unique substring
+    // (handles cases where only part of the visible text is in one source location)
+    const words = trimmed.split(/\s+/)
+    if (words.length >= 4) {
+      // Try the first 3/4 of words as a shorter search
+      const partial = words.slice(0, Math.ceil(words.length * 0.75)).join(' ')
+      const partialPattern = buildFlexiblePattern(partial)
+      if (partialPattern) {
+        for (const [path, { handle, content }] of fileIndex) {
+          const matches = [...content.matchAll(partialPattern)]
+          if (matches.length > 0) {
+            results.push({
+              path, handle, content,
+              match: matches[0][0],
+              occurrences: matches.length,
+              partial: true
+            })
+          }
+        }
+      }
+    }
+
     return results
   }
 
   /**
    * Write updated content to a source file.
+   * Re-reads the file fresh from disk first to avoid overwriting external changes
+   * (e.g. if Claude Code or your editor modified the file between our index and write).
+   * Returns { success, occurrences, freshContent } or { success: false, reason }
    */
-  async function writeFile(fileHandle, oldContent, searchText, replaceText) {
-    const newContent = oldContent.replace(searchText, replaceText)
-    if (newContent === oldContent) return false
+  async function writeFile(fileHandle, cachedContent, searchText, replaceText) {
+    // Re-read fresh content from disk
+    let freshContent
+    try {
+      const file = await fileHandle.getFile()
+      freshContent = await file.text()
+    } catch (err) {
+      return { success: false, reason: `Could not re-read file: ${err.message}` }
+    }
+
+    // Count occurrences in fresh content (transparency for user)
+    let occurrences = 0
+    let idx = -1
+    while ((idx = freshContent.indexOf(searchText, idx + 1)) !== -1) occurrences++
+
+    if (occurrences === 0) {
+      return {
+        success: false,
+        reason: 'Text no longer present in file (it may have been edited externally)'
+      }
+    }
+
+    const newContent = freshContent.replace(searchText, replaceText)
+    if (newContent === freshContent) {
+      return { success: false, reason: 'No changes detected' }
+    }
 
     const writable = await fileHandle.createWritable()
     await writable.write(newContent)
     await writable.close()
 
-    // Update the cache
+    // Update the cache with the fresh content
     for (const [path, entry] of fileIndex) {
       if (entry.handle === fileHandle) {
         fileIndex.set(path, { handle: fileHandle, content: newContent })
         break
       }
     }
-    return true
+    return { success: true, occurrences, freshContent }
   }
 
   // ---------------------------------------------------------------------------
@@ -418,6 +757,8 @@
         return
       }
 
+      setElementState(imgEl, 'saving')
+
       // Determine target filename and path
       const newFileName = file.name
       const srcParts = currentSrc.split('/')
@@ -443,7 +784,8 @@
         await writable.write(file)
         await writable.close()
 
-        // Update the src in source files
+        // Update the src in source files (only if filename changed)
+        let srcUpdateNote = ''
         if (currentSrc !== newSrc) {
           const results = searchFiles(currentSrc)
           if (results.length > 0) {
@@ -452,17 +794,21 @@
               : await pickFromResults(results, currentSrc)
 
             if (target) {
-              await writeFile(target.handle, target.content, currentSrc, newSrc)
+              const result = await writeFile(target.handle, target.content, currentSrc, newSrc)
+              if (result.success) {
+                logEdit(target.path, currentSrc, newSrc, result.freshContent, target.handle)
+                srcUpdateNote = ` & updated src in ${target.path}`
+              }
             }
           }
         }
 
         // Update preview immediately
         imgEl.src = URL.createObjectURL(file)
-        editCount++
-        updateToolbar()
-        toast(`Image replaced → ${newFileName}`, 'success')
+        setElementState(imgEl, 'success')
+        toast(`Image replaced → ${newFileName}${srcUpdateNote}`, 'success')
       } catch (err) {
+        setElementState(imgEl, 'error')
         toast(`Image save failed: ${err.message}`, 'error')
       }
     }
@@ -487,14 +833,174 @@
 
     el.setAttribute('contenteditable', 'true')
     el.setAttribute('data-wh-editing', 'true')
-    el.focus()
 
-    // Select all text for convenience
-    const range = document.createRange()
-    range.selectNodeContents(el)
-    const sel = window.getSelection()
-    sel.removeAllRanges()
-    sel.addRange(range)
+    // Let the browser place the cursor where the user clicked.
+    // Just ensure the element is focused — don't select all.
+    el.focus()
+  }
+
+  /**
+   * Diff old and new text at the word level to find what changed,
+   * PLUS surrounding context words for safe, unambiguous searching.
+   *
+   * "We Build Amazing Websites" → "We Build Incredible Websites"
+   *   => { oldChanged: "Amazing", newChanged: "Incredible",
+   *        contextBefore: "We Build", contextAfter: "Websites" }
+   */
+  function diffTexts(oldText, newText) {
+    const oldWords = oldText.trim().split(/\s+/)
+    const newWords = newText.trim().split(/\s+/)
+
+    // Find common prefix length
+    let prefixLen = 0
+    while (
+      prefixLen < oldWords.length &&
+      prefixLen < newWords.length &&
+      oldWords[prefixLen] === newWords[prefixLen]
+    ) {
+      prefixLen++
+    }
+
+    // Find common suffix length (from end, not overlapping prefix)
+    let suffixLen = 0
+    while (
+      suffixLen < oldWords.length - prefixLen &&
+      suffixLen < newWords.length - prefixLen &&
+      oldWords[oldWords.length - 1 - suffixLen] === newWords[newWords.length - 1 - suffixLen]
+    ) {
+      suffixLen++
+    }
+
+    const endSlice = suffixLen > 0 ? -suffixLen : undefined
+    const oldChanged = oldWords.slice(prefixLen, endSlice).join(' ')
+    const newChanged = newWords.slice(prefixLen, endSlice).join(' ')
+
+    // Grab up to 3 words before and after as context for safe matching
+    const ctxBefore = oldWords.slice(Math.max(0, prefixLen - 3), prefixLen)
+    const ctxAfterStart = oldWords.length - suffixLen
+    const ctxAfter = oldWords.slice(ctxAfterStart, Math.min(oldWords.length, ctxAfterStart + 3))
+
+    return {
+      oldChanged,
+      newChanged,
+      contextBefore: ctxBefore.join(' '),
+      contextAfter: ctxAfter.join(' ')
+    }
+  }
+
+  /**
+   * Log an edit and store enough info to undo it.
+   */
+  function logEdit(path, oldText, newText, oldFileContent, fileHandle) {
+    editLog.push({
+      timestamp: new Date().toISOString(),
+      path,
+      oldText,
+      newText,
+      oldFileContent,
+      handle: fileHandle
+    })
+    editCount++
+    updateToolbar()
+  }
+
+  /**
+   * Undo the most recent edit by restoring the previous file content.
+   */
+  async function undoLastEdit() {
+    if (editLog.length === 0) {
+      toast('Nothing to undo', 'info')
+      return
+    }
+
+    const last = editLog.pop()
+    try {
+      const writable = await last.handle.createWritable()
+      await writable.write(last.oldFileContent)
+      await writable.close()
+
+      // Update cache
+      for (const [path, entry] of fileIndex) {
+        if (entry.handle === last.handle) {
+          fileIndex.set(path, { handle: last.handle, content: last.oldFileContent })
+          break
+        }
+      }
+
+      editCount = Math.max(0, editCount - 1)
+      updateToolbar()
+      toast(`Undone → ${last.path}`, 'success')
+    } catch (err) {
+      editLog.push(last) // put it back if undo failed
+      toast(`Undo failed: ${err.message}`, 'error')
+    }
+  }
+
+  /**
+   * Apply a visual feedback state to an element (saving, success, error).
+   * Auto-clears after the animation.
+   */
+  function setElementState(el, state) {
+    if (!el) return
+    el.setAttribute('data-wh-state', state)
+    if (state === 'success' || state === 'error') {
+      setTimeout(() => {
+        if (el.getAttribute('data-wh-state') === state) {
+          el.removeAttribute('data-wh-state')
+        }
+      }, 700)
+    }
+  }
+
+  function clearElementState(el) {
+    if (el) el.removeAttribute('data-wh-state')
+  }
+
+  /**
+   * When no match can be found, offer to copy a precise Claude Code prompt
+   * so the user can still fix it fast without describing the change from scratch.
+   */
+  function offerClaudePrompt(oldText, newText) {
+    const prompt = `In my codebase, change the text "${oldText.trim()}" to "${newText.trim()}". It may be inside a variable, prop, translation key, or external file rather than inline in the JSX.`
+
+    const container = ensureToastContainer()
+    const el = document.createElement('div')
+    el.className = 'wh-toast wh-error'
+    el.style.pointerEvents = 'auto'
+    el.style.cursor = 'pointer'
+    el.innerHTML = `
+      <div style="font-weight:600;margin-bottom:4px">Couldn't find this text in your source files</div>
+      <div style="font-size:11px;color:#aaa;margin-bottom:6px">
+        Likely a variable, prop, or translation. Click to copy a Claude Code prompt.
+      </div>
+    `
+
+    el.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(prompt)
+        el.innerHTML = `<div style="color:#4ade80">✓ Copied — paste into Claude Code</div>`
+        setTimeout(() => {
+          el.classList.remove('wh-show')
+          el.classList.add('wh-hide')
+          setTimeout(() => el.remove(), 300)
+        }, 1500)
+      } catch (_) {
+        toast('Could not copy to clipboard', 'error')
+      }
+    })
+
+    container.appendChild(el)
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => el.classList.add('wh-show'))
+    })
+
+    setTimeout(() => {
+      if (el.parentNode) {
+        el.classList.remove('wh-show')
+        el.classList.add('wh-hide')
+        setTimeout(() => el.remove(), 300)
+      }
+    }, 8000)
   }
 
   async function finishEditing(el) {
@@ -511,65 +1017,107 @@
 
     if (!dirHandle) {
       toast('No project folder selected', 'error')
+      setElementState(el, 'error')
       el.innerText = originalText
       activeElement = null
       return
     }
 
-    // Search for the original text in source files
-    // Try the raw text first, then try with common HTML patterns
+    // Show saving state on the element itself
+    setElementState(el, 'saving')
+
+    const finalize = (state, restoreOriginal = false) => {
+      if (restoreOriginal) el.innerText = originalText
+      setElementState(el, state)
+      activeElement = null
+    }
+
+    // ---- Strategy 1: full text search (works for simple elements) ----
     let results = searchFiles(originalText.trim())
 
-    // If not found, try searching for just the first line (handles multi-line)
-    if (results.length === 0) {
-      const firstLine = originalText.trim().split('\n')[0].trim()
-      if (firstLine.length > 10) {
-        results = searchFiles(firstLine)
-      }
-    }
-
-    if (results.length === 0) {
-      toast('Could not find text in source files', 'error')
-      el.innerText = originalText
-      activeElement = null
-      return
-    }
-
-    let target
-    if (results.length === 1) {
-      target = results[0]
-    } else {
-      target = await pickFromResults(results, originalText.trim())
-    }
-
-    if (!target) {
-      el.innerText = originalText
-      activeElement = null
-      return
-    }
-
-    try {
-      const success = await writeFile(
-        target.handle,
-        target.content,
-        originalText.trim(),
-        newText.trim()
-      )
-
-      if (success) {
-        editCount++
-        updateToolbar()
-        toast(`Saved → ${target.path}`, 'success')
+    if (results.length > 0) {
+      let target
+      if (results.length === 1) {
+        target = results[0]
       } else {
-        toast('No changes detected in file', 'error')
-        el.innerText = originalText
+        target = await pickFromResults(results, originalText.trim())
       }
-    } catch (err) {
-      toast(`Write failed: ${err.message}`, 'error')
-      el.innerText = originalText
+
+      if (target) {
+        try {
+          const result = await writeFile(
+            target.handle, target.content,
+            target.match, newText.trim()
+          )
+          if (result.success) {
+            logEdit(target.path, target.match, newText.trim(), result.freshContent, target.handle)
+            const occNote = result.occurrences > 1
+              ? ` · ${result.occurrences} matches in file (first changed — undo if wrong)`
+              : ''
+            const partialNote = target.partial ? ' (partial match)' : ''
+            toast(`Saved → ${target.path}${partialNote}${occNote}`, 'success')
+            return finalize('success')
+          } else {
+            // Fall through to Strategy 2
+          }
+        } catch (err) {
+          toast(`Write failed: ${err.message}`, 'error')
+          return finalize('error', true)
+        }
+      }
     }
 
-    activeElement = null
+    // ---- Strategy 2: context-aware diff search (handles spans, mixed content) ----
+    const diff = diffTexts(originalText, newText)
+
+    if (diff.oldChanged) {
+      // Build a context phrase: "[words before] [changed word] [words after]"
+      // Searching with surrounding context narrows to the right file AND location,
+      // far safer than searching for a single word in isolation.
+      const contextPhrase = [diff.contextBefore, diff.oldChanged, diff.contextAfter]
+        .filter(Boolean).join(' ')
+
+      let diffResults = searchFiles(contextPhrase)
+
+      if (diffResults.length > 0) {
+        let target
+        if (diffResults.length === 1) {
+          target = diffResults[0]
+        } else {
+          target = await pickFromResults(diffResults, contextPhrase)
+        }
+
+        if (target) {
+          try {
+            const matchedContext = target.match
+            const changedPattern = buildFlexiblePattern(diff.oldChanged)
+            if (changedPattern) {
+              const newContext = matchedContext.replace(changedPattern, diff.newChanged)
+              const result = await writeFile(
+                target.handle, target.content,
+                matchedContext, newContext
+              )
+              if (result.success) {
+                logEdit(target.path, diff.oldChanged, diff.newChanged, result.freshContent, target.handle)
+                const occNote = result.occurrences > 1
+                  ? ` · ${result.occurrences} matches in file`
+                  : ''
+                toast(`Saved → ${target.path} ("${diff.oldChanged}" → "${diff.newChanged}")${occNote}`, 'success')
+                return finalize('success')
+              }
+            }
+          } catch (err) {
+            toast(`Write failed: ${err.message}`, 'error')
+            return finalize('error', true)
+          }
+        }
+      }
+    }
+
+    // ---- Neither strategy found a match ----
+    // Offer a Claude Code prompt so the user can still fix it quickly
+    offerClaudePrompt(originalText, newText)
+    finalize('error', true)
   }
 
   // ---------------------------------------------------------------------------
@@ -643,13 +1191,36 @@
   }
 
   function handleKeydown(e) {
+    // Global Cmd/Ctrl+E: toggle edit mode (when not actively editing text)
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'e' && !activeElement) {
+      if (!dirHandle) {
+        toast('Select a project folder first', 'info')
+        return
+      }
+      e.preventDefault()
+      editMode = !editMode
+      document.body.classList.toggle('wh-edit-mode', editMode)
+      tagEditableElements()
+      updateToolbar()
+      return
+    }
+
+    // Global undo: Cmd/Ctrl+Z when NOT editing an element
+    if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !activeElement && editLog.length > 0) {
+      e.preventDefault()
+      undoLastEdit()
+      renderLog()
+      return
+    }
+
     if (!activeElement) return
 
-    // Escape cancels editing
+    // Escape cancels editing (restore original, no save)
     if (e.key === 'Escape') {
       activeElement.innerText = originalText
       activeElement.removeAttribute('contenteditable')
       activeElement.removeAttribute('data-wh-editing')
+      clearElementState(activeElement)
       activeElement = null
       return
     }
@@ -688,11 +1259,27 @@
     bar.innerHTML = `
       <span class="wh-logo">W</span>
       <span class="wh-dot" id="wh-dot"></span>
-      <button id="wh-btn-folder">Open Folder</button>
-      <button id="wh-btn-edit">Edit Mode</button>
+      <button id="wh-btn-folder" title="Select your project folder">Open Folder</button>
+      <button id="wh-btn-edit" title="Toggle edit mode (⌘E)">Edit Mode</button>
+      <button id="wh-btn-undo" style="display:none" title="Undo last edit (⌘Z)">⌘Z Undo</button>
+      <button id="wh-btn-log" style="display:none" title="Show edit log">Log</button>
       <span class="wh-status" id="wh-status">No folder selected</span>
     `
     document.body.appendChild(bar)
+
+    // Log panel (hidden by default)
+    const logPanel = document.createElement('div')
+    logPanel.id = 'wh-log-panel'
+    logPanel.innerHTML = `
+      <div class="wh-log-header">
+        <span>Edit Log</span>
+        <button class="wh-undo-btn" id="wh-log-undo">Undo Last</button>
+      </div>
+      <div class="wh-log-list" id="wh-log-list">
+        <div class="wh-log-empty">No edits yet</div>
+      </div>
+    `
+    document.body.appendChild(logPanel)
 
     document.getElementById('wh-btn-folder').addEventListener('click', async () => {
       await pickProjectFolder()
@@ -708,6 +1295,51 @@
       tagEditableElements()
       updateToolbar()
     })
+
+    document.getElementById('wh-btn-undo').addEventListener('click', async () => {
+      await undoLastEdit()
+      renderLog()
+    })
+
+    document.getElementById('wh-log-undo').addEventListener('click', async () => {
+      await undoLastEdit()
+      renderLog()
+    })
+
+    document.getElementById('wh-btn-log').addEventListener('click', () => {
+      const panel = document.getElementById('wh-log-panel')
+      panel.classList.toggle('wh-open')
+      renderLog()
+    })
+  }
+
+  function truncate(str, len) {
+    return str.length > len ? str.substring(0, len - 1) + '…' : str
+  }
+
+  function renderLog() {
+    const list = document.getElementById('wh-log-list')
+    if (!list) return
+
+    if (editLog.length === 0) {
+      list.innerHTML = '<div class="wh-log-empty">No edits yet</div>'
+      return
+    }
+
+    // Show most recent first
+    list.innerHTML = [...editLog].reverse().map((entry, i) => {
+      const time = new Date(entry.timestamp).toLocaleTimeString()
+      return `
+        <div class="wh-log-entry">
+          <div class="wh-log-file">${entry.path}</div>
+          <div class="wh-log-diff">
+            <span class="wh-log-old">${truncate(entry.oldText, 60)}</span>
+            → <span class="wh-log-new">${truncate(entry.newText, 60)}</span>
+          </div>
+          <div class="wh-log-time">${time}</div>
+        </div>
+      `
+    }).join('')
   }
 
   function updateToolbar() {
@@ -715,8 +1347,14 @@
     const status = document.getElementById('wh-status')
     const editBtn = document.getElementById('wh-btn-edit')
     const folderBtn = document.getElementById('wh-btn-folder')
+    const undoBtn = document.getElementById('wh-btn-undo')
+    const logBtn = document.getElementById('wh-btn-log')
 
     if (!dot) return
+
+    // Show/hide undo and log buttons based on edit history
+    undoBtn.style.display = editLog.length > 0 ? '' : 'none'
+    logBtn.style.display = editLog.length > 0 ? '' : 'none'
 
     if (!dirHandle) {
       dot.className = 'wh-dot'
@@ -770,7 +1408,7 @@
   // INIT
   // ---------------------------------------------------------------------------
 
-  function init() {
+  async function init() {
     // Check API support
     if (!('showDirectoryPicker' in window)) {
       alert('Webhaus Editor requires Chrome or Edge (File System Access API not supported in this browser).')
@@ -789,6 +1427,9 @@
     observeVisibility()
 
     toast('Webhaus Editor loaded', 'info')
+
+    // Try to restore previously granted folder for this origin
+    await tryRestoreFolder()
   }
 
   // Run
