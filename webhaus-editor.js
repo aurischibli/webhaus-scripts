@@ -1,5 +1,5 @@
 /**
- * Webhaus Editor v1.4.0
+ * Webhaus Editor v1.4.1
  * 
  * On-canvas inline editor for vibe-coded sites.
  * Edit text and images directly on any localhost page.
@@ -8,19 +8,18 @@
  * Editing feels like Google Docs: single click positions cursor,
  * double-click selects word, drag selects range — all native browser behavior.
  *
- * v1.4.0 — Runtime source instrumentation. When edit mode turns on, React
- * fibers are walked and every editable element gets a data-wh-source attribute
- * containing the exact file:line:col from React's _debugSource. Strategy 0 in
- * the search cascade goes straight there — no global search needed for most
- * edits. Position-aware file writes so we replace at the exact occurrence,
- * even if the same text appears elsewhere in the file.
+ * v1.4.1 — Diagnostics + escape hatch:
+ *   - Verbose indexing logs (every directory entered, every error caught)
+ *   - window.webhausEditor debug API (diagnostics, files, find, fiber, write, reindex)
+ *   - Manual search modal in the failure toast
+ *   - Low-file-count warning when index looks suspiciously small
  * 
  * Requirements: Chrome/Edge (File System Access API)
  */
 ;(function () {
   'use strict'
 
-  const WEBHAUS_EDITOR_VERSION = '1.4.0'
+  const WEBHAUS_EDITOR_VERSION = '1.4.1'
 
   // Bail if already loaded
   if (window.__webhausEditor) {
@@ -418,6 +417,116 @@
       #wh-log-panel button.wh-undo-btn:hover {
         background: rgba(255,255,255,0.08);
       }
+
+      /* Failure toast action buttons */
+      .wh-toast-btn {
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.12);
+        color: #e0e0e0;
+        padding: 4px 10px;
+        border-radius: 5px;
+        cursor: pointer;
+        font-size: 11px;
+        font-family: inherit;
+        transition: background 0.15s;
+      }
+      .wh-toast-btn:hover {
+        background: rgba(255,255,255,0.16);
+      }
+
+      /* Manual search modal */
+      #wh-manual-search {
+        position: fixed;
+        inset: 0;
+        z-index: 99999999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0,0,0,0.6);
+        font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      }
+      #wh-manual-search .wh-search-modal {
+        background: #1a1a1a;
+        color: #e0e0e0;
+        border-radius: 12px;
+        padding: 20px;
+        max-width: 600px;
+        width: 90%;
+        max-height: 80vh;
+        display: flex;
+        flex-direction: column;
+        box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+      }
+      #wh-manual-search h3 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        font-weight: 600;
+        color: #fff;
+      }
+      #wh-manual-search .wh-search-sub {
+        font-size: 12px;
+        color: #888;
+        margin-bottom: 10px;
+      }
+      #wh-manual-search input {
+        background: #0d0d0d;
+        border: 1px solid rgba(255,255,255,0.12);
+        color: #e0e0e0;
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-size: 13px;
+        font-family: inherit;
+        width: 100%;
+        box-sizing: border-box;
+        outline: none;
+      }
+      #wh-manual-search input:focus {
+        border-color: #2563eb;
+      }
+      #wh-manual-search .wh-search-info {
+        font-size: 11px;
+        color: #888;
+        margin: 8px 0;
+      }
+      #wh-manual-search .wh-search-results {
+        flex: 1;
+        overflow-y: auto;
+        max-height: 300px;
+        margin-bottom: 10px;
+      }
+      #wh-manual-search .wh-search-result {
+        padding: 8px 10px;
+        border-radius: 6px;
+        cursor: pointer;
+        margin-bottom: 4px;
+        transition: background 0.1s;
+      }
+      #wh-manual-search .wh-search-result:hover {
+        background: rgba(255,255,255,0.04);
+      }
+      #wh-manual-search .wh-search-result.wh-selected {
+        background: rgba(37, 99, 235, 0.2);
+        border-left: 2px solid #2563eb;
+      }
+      #wh-manual-search .wh-search-path {
+        font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+        font-size: 11px;
+        color: #aaa;
+        margin-bottom: 2px;
+      }
+      #wh-manual-search .wh-search-snippet {
+        font-size: 11px;
+        color: #777;
+        font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #wh-manual-search .wh-search-replace-section {
+        border-top: 1px solid rgba(255,255,255,0.08);
+        padding-top: 12px;
+        margin-top: 6px;
+      }
     `
     document.head.appendChild(style)
   }
@@ -543,24 +652,86 @@
     }
   }
 
-  async function indexDirectory(handle, basePath) {
-    for await (const [name, entry] of handle.entries()) {
-      if (name.startsWith('.') && name !== '.html') continue
-      const fullPath = basePath ? `${basePath}/${name}` : name
+  // Indexing diagnostics — populated each time we rebuild the index
+  let indexStats = null
 
-      if (entry.kind === 'directory') {
-        if (!IGNORED_DIRS.includes(name)) {
-          await indexDirectory(entry, fullPath)
-        }
-      } else {
-        const ext = name.includes('.') ? '.' + name.split('.').pop().toLowerCase() : ''
-        if (SOURCE_EXTENSIONS.includes(ext)) {
+  async function indexDirectory(handle, basePath) {
+    // Top-level call (no basePath) → initialize stats
+    const isTopLevel = !basePath
+    if (isTopLevel) {
+      indexStats = {
+        dirsEntered: [],
+        dirsSkipped: [],
+        filesAdded: 0,
+        filesSkippedByExt: 0,
+        readErrors: [],
+        extensionBreakdown: {},
+        startedAt: performance.now()
+      }
+    }
+
+    try {
+      for await (const [name, entry] of handle.entries()) {
+        // Skip dot-prefixed names (hidden files/folders like .git, .env, .DS_Store)
+        if (name.startsWith('.')) continue
+
+        const fullPath = basePath ? `${basePath}/${name}` : name
+
+        if (entry.kind === 'directory') {
+          if (IGNORED_DIRS.includes(name)) {
+            indexStats.dirsSkipped.push(`${fullPath} (ignored by name)`)
+            continue
+          }
+          indexStats.dirsEntered.push(fullPath)
+          try {
+            await indexDirectory(entry, fullPath)
+          } catch (err) {
+            indexStats.readErrors.push({ path: fullPath, kind: 'directory', error: err.message })
+          }
+        } else if (entry.kind === 'file') {
+          const ext = name.includes('.') ? '.' + name.split('.').pop().toLowerCase() : ''
+          if (!SOURCE_EXTENSIONS.includes(ext)) {
+            indexStats.filesSkippedByExt++
+            continue
+          }
           try {
             const file = await entry.getFile()
             const content = await file.text()
             fileIndex.set(fullPath, { handle: entry, content })
-          } catch (_) { /* skip unreadable files */ }
+            indexStats.filesAdded++
+            indexStats.extensionBreakdown[ext] = (indexStats.extensionBreakdown[ext] || 0) + 1
+          } catch (err) {
+            indexStats.readErrors.push({ path: fullPath, kind: 'file', error: err.message })
+          }
         }
+      }
+    } catch (err) {
+      indexStats.readErrors.push({ path: basePath || '(root)', kind: 'iteration', error: err.message })
+    }
+
+    if (isTopLevel) {
+      indexStats.durationMs = Math.round(performance.now() - indexStats.startedAt)
+      console.groupCollapsed(
+        `%c[Webhaus Editor] Index complete — ${indexStats.filesAdded} files in ${indexStats.durationMs}ms`,
+        'color:#2563eb;font-weight:bold'
+      )
+      console.log('Files added by extension:', indexStats.extensionBreakdown)
+      console.log('Directories entered:', indexStats.dirsEntered.length, indexStats.dirsEntered)
+      if (indexStats.dirsSkipped.length) {
+        console.log('Directories skipped:', indexStats.dirsSkipped)
+      }
+      console.log('Files skipped (extension not indexed):', indexStats.filesSkippedByExt)
+      if (indexStats.readErrors.length) {
+        console.warn('Read errors:', indexStats.readErrors)
+      }
+      console.groupEnd()
+
+      // Warn if the file count looks suspiciously low
+      if (indexStats.filesAdded < 30 && indexStats.dirsEntered.length < 5) {
+        setTimeout(() => toast(
+          `Only ${indexStats.filesAdded} files indexed. You may have picked a subfolder — check the console for details.`,
+          'error'
+        ), 100)
       }
     }
   }
@@ -1342,9 +1513,9 @@
   }
 
   /**
-   * When no match can be found, offer to copy a precise Claude Code prompt
-   * so the user can still fix it fast without describing the change from scratch.
-   * Includes React-detected source files for better targeting.
+   * When no match can be found, offer two recovery paths:
+   *   1. Copy a Claude Code prompt (handles dynamic text)
+   *   2. Manual search dialog (handles indexing gaps / missing React debug info)
    */
   function offerClaudePrompt(oldText, newText, hintFiles = []) {
     const fileList = hintFiles.length > 0
@@ -1357,32 +1528,41 @@
     const el = document.createElement('div')
     el.className = 'wh-toast wh-error'
     el.style.pointerEvents = 'auto'
-    el.style.cursor = 'pointer'
+    el.style.minWidth = '320px'
 
     const hintHtml = hintFiles.length > 0
-      ? `<div style="font-size:10px;color:#888;margin-top:6px;font-family:'SF Mono',monospace">React source: ${hintFiles[0].path}${hintFiles.length > 1 ? ` (+${hintFiles.length - 1} more)` : ''}</div>`
-      : ''
+      ? `<div style="font-size:10px;color:#888;margin-top:8px;font-family:'SF Mono',monospace">React source: ${hintFiles[0].path}${hintFiles.length > 1 ? ` (+${hintFiles.length - 1} more)` : ''}</div>`
+      : `<div style="font-size:10px;color:#888;margin-top:8px;font-family:'SF Mono',monospace">React source: (none — _debugSource not populated)</div>`
 
     el.innerHTML = `
       <div style="font-weight:600;margin-bottom:4px">Couldn't find this text in your source files</div>
-      <div style="font-size:11px;color:#aaa">
-        Likely computed at runtime (concatenation, interpolation, API). Click to copy a Claude Code prompt.
+      <div style="font-size:11px;color:#aaa;margin-bottom:10px">
+        Indexed ${fileIndex.size} files. Try a manual search, or copy a Claude Code prompt.
+      </div>
+      <div style="display:flex;gap:6px">
+        <button class="wh-toast-btn wh-search-btn">Search manually</button>
+        <button class="wh-toast-btn wh-claude-btn">Copy Claude prompt</button>
       </div>
       ${hintHtml}
     `
 
-    el.addEventListener('click', async () => {
+    el.querySelector('.wh-claude-btn').addEventListener('click', async (e) => {
+      e.stopPropagation()
       try {
         await navigator.clipboard.writeText(prompt)
-        el.innerHTML = `<div style="color:#4ade80">✓ Copied — paste into Claude Code</div>`
-        setTimeout(() => {
-          el.classList.remove('wh-show')
-          el.classList.add('wh-hide')
-          setTimeout(() => el.remove(), 300)
-        }, 1500)
+        toast('Prompt copied — paste into Claude Code', 'success')
+        el.classList.remove('wh-show')
+        el.classList.add('wh-hide')
+        setTimeout(() => el.remove(), 300)
       } catch (_) {
         toast('Could not copy to clipboard', 'error')
       }
+    })
+
+    el.querySelector('.wh-search-btn').addEventListener('click', (e) => {
+      e.stopPropagation()
+      el.remove()
+      openManualSearch(oldText, newText)
     })
 
     container.appendChild(el)
@@ -1396,7 +1576,121 @@
         el.classList.add('wh-hide')
         setTimeout(() => el.remove(), 300)
       }
-    }, 10000)
+    }, 15000)
+  }
+
+  /**
+   * Manual search modal. Lets the user type any search term, see matching files,
+   * pick one to apply the edit to. Last-resort escape hatch when auto-detection fails.
+   */
+  function openManualSearch(originalText, newText) {
+    const existing = document.getElementById('wh-manual-search')
+    if (existing) existing.remove()
+
+    const modal = document.createElement('div')
+    modal.id = 'wh-manual-search'
+    modal.innerHTML = `
+      <div class="wh-search-modal">
+        <h3>Manual search</h3>
+        <div class="wh-search-sub">
+          ${fileIndex.size} files indexed. Type any unique part of the text you're trying to find.
+        </div>
+        <input type="text" id="wh-search-input" placeholder="Search text..." />
+        <div class="wh-search-info" id="wh-search-info">Type to search</div>
+        <div class="wh-search-results" id="wh-search-results"></div>
+        <div class="wh-search-replace-section" id="wh-search-replace-section" style="display:none">
+          <div class="wh-search-sub">Replace with:</div>
+          <input type="text" id="wh-search-replace" />
+          <div style="display:flex;gap:6px;margin-top:10px">
+            <button class="wh-toast-btn wh-search-apply">Apply to selected file</button>
+            <button class="wh-toast-btn wh-search-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+    `
+    document.body.appendChild(modal)
+
+    const input = document.getElementById('wh-search-input')
+    const results = document.getElementById('wh-search-results')
+    const info = document.getElementById('wh-search-info')
+    const replaceSection = document.getElementById('wh-search-replace-section')
+    const replaceInput = document.getElementById('wh-search-replace')
+    let selectedResult = null
+
+    // Pre-fill with a reasonable substring of the original text
+    const initial = (originalText || '').trim().split(/\s+/).slice(0, 4).join(' ')
+    input.value = initial
+    replaceInput.value = newText.trim()
+
+    const renderResults = () => {
+      const query = input.value.trim()
+      if (!query) {
+        info.textContent = 'Type to search'
+        results.innerHTML = ''
+        replaceSection.style.display = 'none'
+        return
+      }
+
+      const hits = searchFiles(query)
+      info.textContent = `${hits.length} file${hits.length === 1 ? '' : 's'} contain "${query}"`
+
+      results.innerHTML = hits.slice(0, 50).map((r, i) => {
+        const idx = r.content.indexOf(r.match)
+        const lineNum = r.content.substring(0, idx).split('\n').length
+        // Show a snippet of context around the match
+        const snippet = r.content
+          .substring(Math.max(0, idx - 40), Math.min(r.content.length, idx + r.match.length + 40))
+          .replace(/\n/g, ' ')
+          .replace(/</g, '&lt;')
+        return `
+          <div class="wh-search-result" data-idx="${i}">
+            <div class="wh-search-path">${r.path}:${lineNum}</div>
+            <div class="wh-search-snippet">…${snippet}…</div>
+          </div>
+        `
+      }).join('')
+
+      results.querySelectorAll('.wh-search-result').forEach(el => {
+        el.addEventListener('click', () => {
+          results.querySelectorAll('.wh-search-result').forEach(r => r.classList.remove('wh-selected'))
+          el.classList.add('wh-selected')
+          selectedResult = hits[parseInt(el.dataset.idx, 10)]
+          replaceSection.style.display = 'block'
+        })
+      })
+    }
+
+    input.addEventListener('input', renderResults)
+    renderResults()
+
+    modal.querySelector('.wh-search-apply').addEventListener('click', async () => {
+      if (!selectedResult) return
+      const findText = selectedResult.match
+      const replaceText = replaceInput.value
+      try {
+        const result = await writeFile(
+          selectedResult.handle, selectedResult.content,
+          findText, replaceText
+        )
+        if (result.success) {
+          logEdit(selectedResult.path, findText, replaceText, result.freshContent, selectedResult.handle)
+          toast(`Saved → ${selectedResult.path}`, 'success')
+          modal.remove()
+        } else {
+          toast(`Write failed: ${result.reason}`, 'error')
+        }
+      } catch (err) {
+        toast(`Write failed: ${err.message}`, 'error')
+      }
+    })
+
+    modal.querySelector('.wh-search-cancel').addEventListener('click', () => modal.remove())
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) modal.remove()
+    })
+
+    input.focus()
+    input.select()
   }
 
   /**
@@ -2002,6 +2296,149 @@
   }
 
   // ---------------------------------------------------------------------------
+  // DEBUG API (exposed on window.webhausEditor)
+  // ---------------------------------------------------------------------------
+  // Run these in the DevTools console to diagnose issues without polluting the page UI.
+
+  function setupDebugApi() {
+    window.webhausEditor = {
+      version: WEBHAUS_EDITOR_VERSION,
+
+      /** Print a complete health report of the current state */
+      diagnostics() {
+        const reactHook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__
+        const reactVersion = reactHook && reactHook.renderers
+          ? [...reactHook.renderers.values()][0]?.version
+          : null
+
+        // Test fiber detection on the first editable element
+        let fiberSample = null
+        const sampleEl = document.querySelector('[data-wh-editable]')
+        if (sampleEl) {
+          const fiber = findReactFiber(sampleEl)
+          fiberSample = {
+            element: sampleEl,
+            hasFiber: !!fiber,
+            hasDebugSource: !!(fiber && fiber._debugSource),
+            hasDebugOwner: !!(fiber && fiber._debugOwner),
+            debugSource: fiber && fiber._debugSource,
+            availableKeys: fiber ? Object.keys(fiber).filter(k => k.startsWith('_')) : []
+          }
+        }
+
+        const report = {
+          version: WEBHAUS_EDITOR_VERSION,
+          folder: dirHandle ? dirHandle.name : '(none selected)',
+          indexedFiles: fileIndex.size,
+          editMode,
+          editsThisSession: editCount,
+          reactVersion,
+          fiberSample,
+          indexStats: indexStats ? {
+            directoriesEntered: indexStats.dirsEntered.length,
+            directoriesSkipped: indexStats.dirsSkipped.length,
+            filesSkippedByExt: indexStats.filesSkippedByExt,
+            readErrors: indexStats.readErrors.length,
+            extensionBreakdown: indexStats.extensionBreakdown,
+            durationMs: indexStats.durationMs
+          } : null
+        }
+        console.log('%c[Webhaus Editor] Diagnostics', 'color:#2563eb;font-weight:bold', report)
+        return report
+      },
+
+      /** List all indexed files, optionally filtered */
+      files(filter) {
+        const all = [...fileIndex.keys()]
+        const filtered = filter
+          ? all.filter(p => p.includes(filter))
+          : all
+        console.log(`%c[Webhaus Editor] ${filtered.length} files${filter ? ` matching "${filter}"` : ''}`,
+          'color:#2563eb;font-weight:bold')
+        filtered.forEach(p => console.log('  ' + p))
+        return filtered
+      },
+
+      /** Search for text across all indexed files */
+      find(text) {
+        const results = searchFiles(text)
+        console.log(`%c[Webhaus Editor] "${text}" found in ${results.length} files`,
+          'color:#2563eb;font-weight:bold')
+        results.forEach(r => {
+          const lineNumber = r.content.substring(0, r.content.indexOf(r.match)).split('\n').length
+          console.log(`  ${r.path}:${lineNumber}`)
+        })
+        return results
+      },
+
+      /** Inspect the React fiber for a given DOM element (or first editable if none passed) */
+      fiber(el) {
+        el = el || document.querySelector('[data-wh-editable]')
+        if (!el) {
+          console.warn('No element provided and no editable element found')
+          return null
+        }
+        const fiber = findReactFiber(el)
+        if (!fiber) {
+          console.warn('No React fiber found on element', el)
+          return null
+        }
+        const result = {
+          element: el,
+          fiber,
+          debugSource: fiber._debugSource,
+          debugOwner: fiber._debugOwner ? {
+            type: fiber._debugOwner.type,
+            debugSource: fiber._debugOwner._debugSource
+          } : null,
+          sourceFiles: getReactSourceFiles(el),
+          hintFiles: getReactHintFiles(el).map(h => h.path)
+        }
+        console.log('[Webhaus Editor] Fiber info:', result)
+        return result
+      },
+
+      /** Manually write a find-and-replace to a specific file */
+      async write(filePath, find, replace) {
+        const entry = fileIndex.get(filePath)
+        if (!entry) {
+          console.error(`File not in index: ${filePath}`)
+          return false
+        }
+        if (!entry.content.includes(find)) {
+          console.error(`Text not found in ${filePath}: ${JSON.stringify(find)}`)
+          return false
+        }
+        const result = await writeFile(entry.handle, entry.content, find, replace)
+        if (result.success) {
+          console.log(`[Webhaus Editor] Wrote to ${filePath}`)
+          logEdit(filePath, find, replace, result.freshContent, entry.handle)
+          return true
+        } else {
+          console.error(`[Webhaus Editor] Write failed: ${result.reason}`)
+          return false
+        }
+      },
+
+      /** Re-index the project (useful if files were added externally) */
+      async reindex() {
+        if (!dirHandle) {
+          console.warn('No project folder selected')
+          return
+        }
+        fileIndex.clear()
+        await indexDirectory(dirHandle, '')
+        updateToolbar()
+        console.log(`[Webhaus Editor] Re-indexed: ${fileIndex.size} files`)
+      }
+    }
+    console.log(
+      '%c[Webhaus Editor] Debug API ready. Try webhausEditor.diagnostics() or webhausEditor.find("your text")',
+      'color:#888;font-style:italic'
+    )
+  }
+
+  // ---------------------------------------------------------------------------
   // INIT
   // ---------------------------------------------------------------------------
 
@@ -2023,6 +2460,7 @@
 
     observeDOM()
     observeVisibility()
+    setupDebugApi()
 
     toast(`Webhaus Editor v${WEBHAUS_EDITOR_VERSION} loaded`, 'info')
 
