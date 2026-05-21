@@ -1,5 +1,5 @@
 /**
- * Webhaus Editor v1.2.0
+ * Webhaus Editor v1.3.0
  * 
  * On-canvas inline editor for vibe-coded sites.
  * Edit text and images directly on any localhost page.
@@ -7,13 +7,16 @@
  * 
  * Editing feels like Google Docs: single click positions cursor,
  * double-click selects word, drag selects range — all native browser behavior.
+ *
+ * v1.3.0 — React fiber source detection for finding text in variables,
+ * props, and data files. Expanded file index (.json, .yaml, etc).
  * 
  * Requirements: Chrome/Edge (File System Access API)
  */
 ;(function () {
   'use strict'
 
-  const WEBHAUS_EDITOR_VERSION = '1.2.0'
+  const WEBHAUS_EDITOR_VERSION = '1.3.0'
 
   // Bail if already loaded
   if (window.__webhausEditor) {
@@ -32,8 +35,13 @@
   ]
 
   const SOURCE_EXTENSIONS = [
-    '.html', '.htm', '.jsx', '.tsx', '.js', '.ts',
-    '.astro', '.vue', '.svelte', '.md', '.mdx', '.njk', '.ejs', '.hbs'
+    // Templates and components
+    '.html', '.htm', '.jsx', '.tsx', '.js', '.ts', '.cjs', '.mjs',
+    '.astro', '.vue', '.svelte', '.njk', '.ejs', '.hbs',
+    // Content & markdown
+    '.md', '.mdx',
+    // Data files (common for vibe-coded sites with content separated from components)
+    '.json', '.jsonc', '.yaml', '.yml', '.toml', '.txt', '.csv', '.xml'
   ]
 
   const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.avif', '.ico']
@@ -553,6 +561,99 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // REACT FIBER SOURCE DETECTION
+  // ---------------------------------------------------------------------------
+  // In dev mode, every DOM element rendered by React has internal fiber data
+  // including `_debugSource` (file + line where the JSX is) and `_debugOwner`
+  // (parent component that rendered it). We walk the fiber tree from the
+  // clicked element to collect all component source files in the rendering
+  // chain — text in props/variables almost always lives in one of these files.
+
+  /** Find the React internal fiber attached to a DOM element. */
+  function findReactFiber(el) {
+    if (!el) return null
+    for (const key of Object.keys(el)) {
+      if (key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$')) {
+        return el[key]
+      }
+    }
+    return null
+  }
+
+  /**
+   * Walk the React fiber tree to collect all source file paths in the
+   * rendering chain (this element, its parents, and the components that
+   * rendered them). Returns an array of absolute file paths, ordered most-
+   * specific-first.
+   */
+  function getReactSourceFiles(el) {
+    const paths = []
+    const seen = new Set()
+    let fiber = findReactFiber(el)
+    if (!fiber) return paths
+
+    let cursor = fiber
+    while (cursor) {
+      // The fiber's own source location
+      if (cursor._debugSource && cursor._debugSource.fileName) {
+        const fn = cursor._debugSource.fileName
+        if (!seen.has(fn)) { paths.push(fn); seen.add(fn) }
+      }
+      // The component that rendered this element
+      if (cursor._debugOwner && cursor._debugOwner._debugSource) {
+        const fn = cursor._debugOwner._debugSource.fileName
+        if (fn && !seen.has(fn)) { paths.push(fn); seen.add(fn) }
+      }
+      cursor = cursor.return
+    }
+    return paths
+  }
+
+  /**
+   * Match an absolute file path (from React fiber) to one of our indexed paths.
+   * Tries longest-suffix match.
+   */
+  function matchAbsToIndexed(absolutePath) {
+    if (!absolutePath) return null
+    // Normalize separators
+    const abs = absolutePath.replace(/\\/g, '/')
+
+    let best = null
+    for (const [path, entry] of fileIndex) {
+      const idx = path.replace(/\\/g, '/')
+      if (abs.endsWith('/' + idx) || abs.endsWith(idx) || abs === idx) {
+        if (!best || idx.length > best.path.length) {
+          best = { path, ...entry }
+        }
+      }
+    }
+    return best
+  }
+
+  /**
+   * Get a prioritized list of indexed files that React thinks rendered the
+   * element. Returns objects with { path, handle, content } — same shape as
+   * searchFiles results.
+   */
+  function getReactHintFiles(el) {
+    const absPaths = getReactSourceFiles(el)
+    const hints = []
+    const seen = new Set()
+    for (const abs of absPaths) {
+      const match = matchAbsToIndexed(abs)
+      if (match && !seen.has(match.path)) {
+        hints.push(match)
+        seen.add(match.path)
+      }
+    }
+    return hints
+  }
+
+  // ---------------------------------------------------------------------------
+  // SEARCH
+  // ---------------------------------------------------------------------------
+
   /**
    * Escape special regex characters in a string.
    */
@@ -976,20 +1077,31 @@
   /**
    * When no match can be found, offer to copy a precise Claude Code prompt
    * so the user can still fix it fast without describing the change from scratch.
+   * Includes React-detected source files for better targeting.
    */
-  function offerClaudePrompt(oldText, newText) {
-    const prompt = `In my codebase, change the text "${oldText.trim()}" to "${newText.trim()}". It may be inside a variable, prop, translation key, or external file rather than inline in the JSX.`
+  function offerClaudePrompt(oldText, newText, hintFiles = []) {
+    const fileList = hintFiles.length > 0
+      ? `\n\nReact says this element was rendered by these files (in order of specificity):\n${hintFiles.map(h => `- ${h.path}`).join('\n')}`
+      : ''
+
+    const prompt = `In my codebase, change the text "${oldText.trim()}" to "${newText.trim()}". It may be inside a variable, prop, translation key, or external file rather than inline in the JSX.${fileList}`
 
     const container = ensureToastContainer()
     const el = document.createElement('div')
     el.className = 'wh-toast wh-error'
     el.style.pointerEvents = 'auto'
     el.style.cursor = 'pointer'
+
+    const hintHtml = hintFiles.length > 0
+      ? `<div style="font-size:10px;color:#888;margin-top:6px;font-family:'SF Mono',monospace">React source: ${hintFiles[0].path}${hintFiles.length > 1 ? ` (+${hintFiles.length - 1} more)` : ''}</div>`
+      : ''
+
     el.innerHTML = `
       <div style="font-weight:600;margin-bottom:4px">Couldn't find this text in your source files</div>
-      <div style="font-size:11px;color:#aaa;margin-bottom:6px">
-        Likely a variable, prop, or translation. Click to copy a Claude Code prompt.
+      <div style="font-size:11px;color:#aaa">
+        Likely computed at runtime (concatenation, interpolation, API). Click to copy a Claude Code prompt.
       </div>
+      ${hintHtml}
     `
 
     el.addEventListener('click', async () => {
@@ -1017,7 +1129,18 @@
         el.classList.add('wh-hide')
         setTimeout(() => el.remove(), 300)
       }
-    }, 8000)
+    }, 10000)
+  }
+
+  /**
+   * Given an array of search results and a list of React-hinted files,
+   * return only the results that match a hint (if any do). Falls back to
+   * all results if no hint matches.
+   */
+  function preferHints(results, hintPaths) {
+    if (!hintPaths || hintPaths.length === 0) return results
+    const hinted = results.filter(r => hintPaths.includes(r.path))
+    return hinted.length > 0 ? hinted : results
   }
 
   async function finishEditing(el) {
@@ -1028,6 +1151,12 @@
     // the user clicks between elements rapidly.
     const originalText = el.getAttribute('data-wh-original') || ''
     const newText = el.innerText
+
+    // Capture React fiber hints BEFORE we mutate any state. These tell us
+    // which source files React thinks rendered this element — used to
+    // disambiguate matches and as the safe scope for last-resort searches.
+    const hintFiles = getReactHintFiles(el)
+    const hintPaths = hintFiles.map(h => h.path)
 
     // Clean up tracking attributes — but keep contentEditable since edit mode is still on
     el.removeAttribute('data-wh-editing')
@@ -1053,8 +1182,9 @@
       setElementState(el, state)
     }
 
-    // ---- Strategy 1: full text search (works for simple elements) ----
+    // ---- Strategy 1: full text search ----
     let results = searchFiles(originalText.trim())
+    results = preferHints(results, hintPaths)
 
     if (results.length > 0) {
       let target
@@ -1078,8 +1208,6 @@
             const partialNote = target.partial ? ' (partial match)' : ''
             toast(`Saved → ${target.path}${partialNote}${occNote}`, 'success')
             return finalize('success')
-          } else {
-            // Fall through to Strategy 2
           }
         } catch (err) {
           toast(`Write failed: ${err.message}`, 'error')
@@ -1088,17 +1216,15 @@
       }
     }
 
-    // ---- Strategy 2: context-aware diff search (handles spans, mixed content) ----
+    // ---- Strategy 2: context-aware diff search (spans, mixed content) ----
     const diff = diffTexts(originalText, newText)
 
     if (diff.oldChanged) {
-      // Build a context phrase: "[words before] [changed word] [words after]"
-      // Searching with surrounding context narrows to the right file AND location,
-      // far safer than searching for a single word in isolation.
       const contextPhrase = [diff.contextBefore, diff.oldChanged, diff.contextAfter]
         .filter(Boolean).join(' ')
 
       let diffResults = searchFiles(contextPhrase)
+      diffResults = preferHints(diffResults, hintPaths)
 
       if (diffResults.length > 0) {
         let target
@@ -1120,10 +1246,7 @@
               )
               if (result.success) {
                 logEdit(target.path, diff.oldChanged, diff.newChanged, result.freshContent, target.handle)
-                const occNote = result.occurrences > 1
-                  ? ` · ${result.occurrences} matches in file`
-                  : ''
-                toast(`Saved → ${target.path} ("${diff.oldChanged}" → "${diff.newChanged}")${occNote}`, 'success')
+                toast(`Saved → ${target.path} ("${diff.oldChanged}" → "${diff.newChanged}")`, 'success')
                 return finalize('success')
               }
             }
@@ -1135,9 +1258,51 @@
       }
     }
 
-    // ---- Neither strategy found a match ----
-    // Offer a Claude Code prompt so the user can still fix it quickly
-    offerClaudePrompt(originalText, newText)
+    // ---- Strategy 3: hint-scoped diff search (variables, props, data files) ----
+    // When text comes from a prop or variable, the full text/context may not
+    // appear together anywhere in source. But the changed word almost always
+    // exists as a literal string in one of the React-hinted files (the
+    // component that rendered the element OR its parent components OR the
+    // data file they import from).
+    //
+    // We restrict the search to hint files only — this is what makes it safe
+    // to search for a short string like "pay" without risking a wrong global
+    // match. Without hints, we skip this strategy.
+    if (hintFiles.length > 0 && diff.oldChanged) {
+      const allMatches = searchFiles(diff.oldChanged)
+      const hintMatches = allMatches.filter(r => hintPaths.includes(r.path))
+
+      if (hintMatches.length > 0) {
+        let target = hintMatches.length === 1
+          ? hintMatches[0]
+          : await pickFromResults(hintMatches, diff.oldChanged)
+
+        if (target) {
+          try {
+            const result = await writeFile(
+              target.handle, target.content,
+              target.match, diff.newChanged
+            )
+            if (result.success) {
+              logEdit(target.path, diff.oldChanged, diff.newChanged, result.freshContent, target.handle)
+              const occNote = result.occurrences > 1
+                ? ` · ${result.occurrences} matches in file (first changed — undo if wrong)`
+                : ''
+              toast(`Saved → ${target.path} via React source ("${diff.oldChanged}" → "${diff.newChanged}")${occNote}`, 'success')
+              return finalize('success')
+            }
+          } catch (err) {
+            toast(`Write failed: ${err.message}`, 'error')
+            return finalize('error', true)
+          }
+        }
+      }
+    }
+
+    // ---- All strategies failed ----
+    // Offer a Claude Code prompt so the user can still fix it quickly.
+    // Include hint files in the prompt for better targeting.
+    offerClaudePrompt(originalText, newText, hintFiles)
     finalize('error', true)
   }
 
