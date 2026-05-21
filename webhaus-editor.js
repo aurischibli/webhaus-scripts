@@ -1,25 +1,26 @@
 /**
- * Webhaus Editor v1.0
+ * Webhaus Editor v1.2.0
  * 
  * On-canvas inline editor for vibe-coded sites.
  * Edit text and images directly on any localhost page.
  * Writes changes to source files via the File System Access API.
  * 
- * Usage:
- *   1. Drag the bookmarklet to your bookmarks bar (see README)
- *   2. Open your site on localhost
- *   3. Click the bookmarklet
- *   4. Pick your project folder (once per session)
- *   5. Click any text or image to edit
+ * Editing feels like Google Docs: single click positions cursor,
+ * double-click selects word, drag selects range — all native browser behavior.
  * 
  * Requirements: Chrome/Edge (File System Access API)
  */
 ;(function () {
   'use strict'
 
+  const WEBHAUS_EDITOR_VERSION = '1.2.0'
+
   // Bail if already loaded
-  if (window.__webhausEditor) return
-  window.__webhausEditor = true
+  if (window.__webhausEditor) {
+    console.log(`[Webhaus Editor] Already loaded (v${window.__webhausEditor})`)
+    return
+  }
+  window.__webhausEditor = WEBHAUS_EDITOR_VERSION
 
   // ---------------------------------------------------------------------------
   // CONFIG
@@ -46,8 +47,7 @@
   let dirHandle = null
   let fileIndex = new Map()   // relativePath -> { handle, content }
   let editMode = false
-  let activeElement = null
-  let originalText = ''
+  let activeElement = null     // currently-focused editable element (or null)
   let editCount = 0
   let editLog = []             // { timestamp, path, oldText, newText, oldFileContent, handle }
 
@@ -822,21 +822,38 @@
   }
 
   // ---------------------------------------------------------------------------
-  // TEXT EDITING
+  // TEXT EDITING — Google Docs style
   // ---------------------------------------------------------------------------
+  // Editable text elements have contentEditable=true set upfront (in tagEditableElements)
+  // so the BROWSER handles cursor placement, double-click word select, and drag-to-select
+  // natively. We just react to focus/blur to track which element is being edited.
 
-  function makeEditable(el) {
-    if (activeElement) finishEditing(activeElement)
+  function handleFocusIn(e) {
+    const el = e.target
+    if (!el || !el.getAttribute) return
+    if (el.getAttribute('data-wh-editable') !== 'text') return
 
-    activeElement = el
-    originalText = el.innerText
-
-    el.setAttribute('contenteditable', 'true')
+    // Capture the original text on first focus so we can diff it later
+    if (!el.hasAttribute('data-wh-original')) {
+      el.setAttribute('data-wh-original', el.innerText)
+    }
     el.setAttribute('data-wh-editing', 'true')
+    activeElement = el
+  }
 
-    // Let the browser place the cursor where the user clicked.
-    // Just ensure the element is focused — don't select all.
-    el.focus()
+  function handleFocusOut(e) {
+    const el = e.target
+    if (!el || !el.getAttribute) return
+    if (el.getAttribute('data-wh-editable') !== 'text') return
+    if (!el.hasAttribute('data-wh-editing')) return
+
+    // Defer briefly so click-to-element-B can complete before we save A
+    setTimeout(() => {
+      // Only finish if focus actually left this element
+      if (document.activeElement !== el && el.hasAttribute('data-wh-editing')) {
+        finishEditing(el)
+      }
+    }, 100)
   }
 
   /**
@@ -1006,12 +1023,18 @@
   async function finishEditing(el) {
     if (!el || !el.hasAttribute('data-wh-editing')) return
 
+    // Read original text from the element itself, not from a global.
+    // This makes editing state element-local and prevents races when
+    // the user clicks between elements rapidly.
+    const originalText = el.getAttribute('data-wh-original') || ''
     const newText = el.innerText
-    el.removeAttribute('contenteditable')
+
+    // Clean up tracking attributes — but keep contentEditable since edit mode is still on
     el.removeAttribute('data-wh-editing')
+    el.removeAttribute('data-wh-original')
+    if (activeElement === el) activeElement = null
 
     if (newText.trim() === originalText.trim()) {
-      activeElement = null
       return
     }
 
@@ -1019,7 +1042,6 @@
       toast('No project folder selected', 'error')
       setElementState(el, 'error')
       el.innerText = originalText
-      activeElement = null
       return
     }
 
@@ -1029,7 +1051,6 @@
     const finalize = (state, restoreOriginal = false) => {
       if (restoreOriginal) el.innerText = originalText
       setElementState(el, state)
-      activeElement = null
     }
 
     // ---- Strategy 1: full text search (works for simple elements) ----
@@ -1125,29 +1146,46 @@
   // ---------------------------------------------------------------------------
 
   function tagEditableElements() {
-    // Remove old tags
+    // Remove old tags AND restore contentEditable to whatever it was before.
+    // IMPORTANT: don't strip data-wh-editing / data-wh-original here — a focusout
+    // may have scheduled a deferred finishEditing that still needs to run.
     document.querySelectorAll('[data-wh-editable]').forEach(el => {
       el.removeAttribute('data-wh-editable')
+      if (el.hasAttribute('data-wh-was-managed')) {
+        el.removeAttribute('contenteditable')
+        el.removeAttribute('data-wh-was-managed')
+      }
     })
 
     if (!editMode) return
 
-    // Tag text elements
+    // Tag text elements AND set contentEditable on them now (not on click).
+    // This lets the browser handle click positioning, double-click word select,
+    // and drag-to-select natively — exactly like Google Docs.
     const textSelectors = 'h1, h2, h3, h4, h5, h6, p, span, a, li, td, th, blockquote, figcaption, label, dt, dd, button, [class*="title"], [class*="heading"], [class*="text"], [class*="description"], [class*="subtitle"]'
 
     document.querySelectorAll(textSelectors).forEach(el => {
       if (SKIP_ELEMENTS.includes(el.tagName)) return
-      if (el.closest('#wh-toolbar, #wh-toast-container, #wh-file-picker')) return
+      if (el.closest('#wh-toolbar, #wh-toast-container, #wh-file-picker, #wh-log-panel')) return
       if (el.children.length > 3) return // Skip containers with many children
-      
+
       // Only tag if it has meaningful direct text content
       const directText = getDirectText(el)
       if (directText.trim().length > 0) {
         el.setAttribute('data-wh-editable', 'text')
+
+        // Set contentEditable now (don't wait for click) — but remember whether
+        // we added it so we can clean up properly when leaving edit mode
+        if (!el.hasAttribute('contenteditable')) {
+          el.setAttribute('contenteditable', 'true')
+          el.setAttribute('data-wh-was-managed', 'true')
+        }
+        // Disable spellcheck red squiggles which are visually noisy
+        el.setAttribute('spellcheck', 'false')
       }
     })
 
-    // Tag images
+    // Tag images (these still use click-to-replace)
     document.querySelectorAll('img').forEach(el => {
       if (el.closest('#wh-toolbar, #wh-toast-container')) return
       el.setAttribute('data-wh-editable', 'image')
@@ -1171,33 +1209,37 @@
 
   function handleClick(e) {
     if (!editMode) return
-    
-    const editable = e.target.closest('[data-wh-editable]')
-    if (!editable) {
-      if (activeElement) finishEditing(activeElement)
-      return
-    }
 
-    e.preventDefault()
-    e.stopPropagation()
+    const editable = e.target.closest('[data-wh-editable]')
+    if (!editable) return
 
     const type = editable.getAttribute('data-wh-editable')
 
     if (type === 'image') {
+      // Images: intercept the click entirely to show the file picker
+      e.preventDefault()
+      e.stopPropagation()
       handleImageEdit(editable)
-    } else if (type === 'text') {
-      makeEditable(editable)
+      return
     }
+
+    // For text: stopPropagation to prevent the page's own click handlers
+    // (links navigating, buttons activating modals, etc.) from firing in edit mode.
+    // But DON'T preventDefault — that would break native cursor placement,
+    // double-click word selection, and drag-to-select.
+    e.stopPropagation()
   }
 
   function handleKeydown(e) {
-    // Global Cmd/Ctrl+E: toggle edit mode (when not actively editing text)
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'e' && !activeElement) {
+    // Global Cmd/Ctrl+E: toggle edit mode (works even while editing — blurs first to save)
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'e') {
       if (!dirHandle) {
         toast('Select a project folder first', 'info')
         return
       }
       e.preventDefault()
+      // If editing, blur first so focusout fires and the in-progress edit gets saved
+      if (activeElement) activeElement.blur()
       editMode = !editMode
       document.body.classList.toggle('wh-edit-mode', editMode)
       tagEditableElements()
@@ -1217,10 +1259,13 @@
 
     // Escape cancels editing (restore original, no save)
     if (e.key === 'Escape') {
-      activeElement.innerText = originalText
-      activeElement.removeAttribute('contenteditable')
-      activeElement.removeAttribute('data-wh-editing')
-      clearElementState(activeElement)
+      const el = activeElement
+      const original = el.getAttribute('data-wh-original') || ''
+      el.innerText = original
+      el.removeAttribute('data-wh-editing')
+      el.removeAttribute('data-wh-original')
+      clearElementState(el)
+      el.blur()
       activeElement = null
       return
     }
@@ -1230,7 +1275,7 @@
       const tag = activeElement.tagName
       if (['H1','H2','H3','H4','H5','H6','SPAN','A','BUTTON','LABEL','LI'].includes(tag)) {
         e.preventDefault()
-        finishEditing(activeElement)
+        activeElement.blur()  // triggers focusout → finishEditing
       }
     }
 
@@ -1238,15 +1283,6 @@
     if ((e.metaKey || e.ctrlKey) && ['b','i','u'].includes(e.key.toLowerCase())) {
       e.preventDefault()
     }
-  }
-
-  function handleBlur(e) {
-    // Small delay to allow click events to process first
-    setTimeout(() => {
-      if (activeElement && !activeElement.contains(document.activeElement)) {
-        finishEditing(activeElement)
-      }
-    }, 150)
   }
 
   // ---------------------------------------------------------------------------
@@ -1257,7 +1293,7 @@
     const bar = document.createElement('div')
     bar.id = 'wh-toolbar'
     bar.innerHTML = `
-      <span class="wh-logo">W</span>
+      <span class="wh-logo" title="Webhaus Editor v${WEBHAUS_EDITOR_VERSION}">W</span>
       <span class="wh-dot" id="wh-dot"></span>
       <button id="wh-btn-folder" title="Select your project folder">Open Folder</button>
       <button id="wh-btn-edit" title="Toggle edit mode (⌘E)">Edit Mode</button>
@@ -1290,6 +1326,8 @@
         toast('Select a project folder first', 'info')
         return
       }
+      // If editing, blur first so focusout fires and the in-progress edit gets saved
+      if (activeElement) activeElement.blur()
       editMode = !editMode
       document.body.classList.toggle('wh-edit-mode', editMode)
       tagEditableElements()
@@ -1421,12 +1459,13 @@
 
     document.addEventListener('click', handleClick, true)
     document.addEventListener('keydown', handleKeydown, true)
-    document.addEventListener('focusout', handleBlur, true)
+    document.addEventListener('focusin', handleFocusIn, true)
+    document.addEventListener('focusout', handleFocusOut, true)
 
     observeDOM()
     observeVisibility()
 
-    toast('Webhaus Editor loaded', 'info')
+    toast(`Webhaus Editor v${WEBHAUS_EDITOR_VERSION} loaded`, 'info')
 
     // Try to restore previously granted folder for this origin
     await tryRestoreFolder()
