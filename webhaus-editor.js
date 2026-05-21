@@ -1,5 +1,5 @@
 /**
- * Webhaus Editor v1.4.1
+ * Webhaus Editor v1.4.2
  * 
  * On-canvas inline editor for vibe-coded sites.
  * Edit text and images directly on any localhost page.
@@ -8,18 +8,19 @@
  * Editing feels like Google Docs: single click positions cursor,
  * double-click selects word, drag selects range — all native browser behavior.
  *
- * v1.4.1 — Diagnostics + escape hatch:
- *   - Verbose indexing logs (every directory entered, every error caught)
- *   - window.webhausEditor debug API (diagnostics, files, find, fiber, write, reindex)
- *   - Manual search modal in the failure toast
- *   - Low-file-count warning when index looks suspiciously small
+ * v1.4.2 — Indexing flipped from allowlist to blocklist:
+ *   - Scans EVERY text file by default
+ *   - Skips known binary extensions (images, fonts, video, archives, executables)
+ *   - Skips lock files and huge files (>5MB)
+ *   - Catches CSS, env files, contentlayer output, MDX, and any custom extension
+ *   - Richer diagnostics showing extension breakdown for both added AND skipped files
  * 
  * Requirements: Chrome/Edge (File System Access API)
  */
 ;(function () {
   'use strict'
 
-  const WEBHAUS_EDITOR_VERSION = '1.4.1'
+  const WEBHAUS_EDITOR_VERSION = '1.4.2'
 
   // Bail if already loaded
   if (window.__webhausEditor) {
@@ -34,18 +35,50 @@
 
   const IGNORED_DIRS = [
     'node_modules', '.git', '.next', '.vercel', '.astro', '.svelte-kit',
-    'dist', 'build', 'out', '.cache', '.turbo', '__pycache__', '.DS_Store'
+    'dist', 'build', 'out', '.cache', '.turbo', '__pycache__', '.DS_Store',
+    'coverage', '.parcel-cache', '.docusaurus', '.expo', '.serverless'
   ]
 
-  const SOURCE_EXTENSIONS = [
-    // Templates and components
-    '.html', '.htm', '.jsx', '.tsx', '.js', '.ts', '.cjs', '.mjs',
-    '.astro', '.vue', '.svelte', '.njk', '.ejs', '.hbs',
-    // Content & markdown
-    '.md', '.mdx',
-    // Data files (common for vibe-coded sites with content separated from components)
-    '.json', '.jsonc', '.yaml', '.yml', '.toml', '.txt', '.csv', '.xml'
-  ]
+  // BLOCKLIST approach: scan every file that isn't obviously binary.
+  // Far more permissive than the old allowlist — catches custom file extensions,
+  // CSS, env files, contentlayer outputs, MDX files, anything text-based.
+  const BINARY_EXTENSIONS = new Set([
+    // Images
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico', '.bmp', '.tiff', '.tif', '.avif', '.heic', '.heif',
+    // Fonts
+    '.woff', '.woff2', '.ttf', '.otf', '.eot',
+    // Audio
+    '.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a', '.opus',
+    // Video
+    '.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v',
+    // Archives
+    '.zip', '.tar', '.gz', '.bz2', '.rar', '.7z', '.xz',
+    // Executables / compiled / native
+    '.exe', '.dll', '.so', '.dylib', '.bin', '.app', '.deb', '.rpm', '.dmg', '.iso',
+    '.pyc', '.pyo', '.class', '.jar', '.o', '.a', '.wasm',
+    // Documents (mostly binary, rarely source)
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.odp',
+    // Other
+    '.psd', '.ai', '.sketch', '.fig', '.blend', '.sqlite', '.db'
+  ])
+
+  // Files to skip by exact name — usually huge auto-generated files
+  const SKIPPED_FILENAMES = new Set([
+    'package-lock.json',
+    'yarn.lock',
+    'pnpm-lock.yaml',
+    'bun.lockb',
+    'composer.lock',
+    'Gemfile.lock',
+    'poetry.lock',
+    'Cargo.lock',
+    '.DS_Store',
+    'Thumbs.db'
+  ])
+
+  // Maximum file size to index — anything bigger gets skipped to avoid
+  // loading huge build artifacts or accidentally-checked-in binaries.
+  const MAX_INDEXED_FILE_SIZE = 5 * 1024 * 1024 // 5MB
 
   const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.avif', '.ico']
 
@@ -663,9 +696,12 @@
         dirsEntered: [],
         dirsSkipped: [],
         filesAdded: 0,
-        filesSkippedByExt: 0,
+        filesSkippedAsBinary: 0,
+        filesSkippedByName: 0,
+        filesSkippedTooLarge: [],
         readErrors: [],
         extensionBreakdown: {},
+        skippedExtensionBreakdown: {},
         startedAt: performance.now()
       }
     }
@@ -689,17 +725,33 @@
             indexStats.readErrors.push({ path: fullPath, kind: 'directory', error: err.message })
           }
         } else if (entry.kind === 'file') {
-          const ext = name.includes('.') ? '.' + name.split('.').pop().toLowerCase() : ''
-          if (!SOURCE_EXTENSIONS.includes(ext)) {
-            indexStats.filesSkippedByExt++
+          // Skip files by name (lock files, .DS_Store, etc.)
+          if (SKIPPED_FILENAMES.has(name)) {
+            indexStats.filesSkippedByName++
             continue
           }
+
+          const ext = name.includes('.') ? '.' + name.split('.').pop().toLowerCase() : ''
+
+          // Skip binary file extensions
+          if (BINARY_EXTENSIONS.has(ext)) {
+            indexStats.filesSkippedAsBinary++
+            indexStats.skippedExtensionBreakdown[ext] =
+              (indexStats.skippedExtensionBreakdown[ext] || 0) + 1
+            continue
+          }
+
           try {
             const file = await entry.getFile()
+            if (file.size > MAX_INDEXED_FILE_SIZE) {
+              indexStats.filesSkippedTooLarge.push(`${fullPath} (${Math.round(file.size / 1024)}KB)`)
+              continue
+            }
             const content = await file.text()
             fileIndex.set(fullPath, { handle: entry, content })
             indexStats.filesAdded++
-            indexStats.extensionBreakdown[ext] = (indexStats.extensionBreakdown[ext] || 0) + 1
+            const extKey = ext || '(no ext)'
+            indexStats.extensionBreakdown[extKey] = (indexStats.extensionBreakdown[extKey] || 0) + 1
           } catch (err) {
             indexStats.readErrors.push({ path: fullPath, kind: 'file', error: err.message })
           }
@@ -720,19 +772,16 @@
       if (indexStats.dirsSkipped.length) {
         console.log('Directories skipped:', indexStats.dirsSkipped)
       }
-      console.log('Files skipped (extension not indexed):', indexStats.filesSkippedByExt)
+      console.log('Files skipped as binary:', indexStats.filesSkippedAsBinary,
+        indexStats.skippedExtensionBreakdown)
+      console.log('Files skipped by name (lock files etc):', indexStats.filesSkippedByName)
+      if (indexStats.filesSkippedTooLarge.length) {
+        console.log('Files skipped (>5MB):', indexStats.filesSkippedTooLarge)
+      }
       if (indexStats.readErrors.length) {
         console.warn('Read errors:', indexStats.readErrors)
       }
       console.groupEnd()
-
-      // Warn if the file count looks suspiciously low
-      if (indexStats.filesAdded < 30 && indexStats.dirsEntered.length < 5) {
-        setTimeout(() => toast(
-          `Only ${indexStats.filesAdded} files indexed. You may have picked a subfolder — check the console for details.`,
-          'error'
-        ), 100)
-      }
     }
   }
 
@@ -2337,9 +2386,12 @@
           indexStats: indexStats ? {
             directoriesEntered: indexStats.dirsEntered.length,
             directoriesSkipped: indexStats.dirsSkipped.length,
-            filesSkippedByExt: indexStats.filesSkippedByExt,
+            filesSkippedAsBinary: indexStats.filesSkippedAsBinary,
+            filesSkippedByName: indexStats.filesSkippedByName,
+            filesSkippedTooLarge: indexStats.filesSkippedTooLarge.length,
             readErrors: indexStats.readErrors.length,
             extensionBreakdown: indexStats.extensionBreakdown,
+            skippedExtensionBreakdown: indexStats.skippedExtensionBreakdown,
             durationMs: indexStats.durationMs
           } : null
         }
