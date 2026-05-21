@@ -1,5 +1,5 @@
 /**
- * Webhaus Editor v1.3.1
+ * Webhaus Editor v1.4.0
  * 
  * On-canvas inline editor for vibe-coded sites.
  * Edit text and images directly on any localhost page.
@@ -8,16 +8,19 @@
  * Editing feels like Google Docs: single click positions cursor,
  * double-click selects word, drag selects range — all native browser behavior.
  *
- * v1.3.1 — React hints now follow import statements to find data files.
- * Strategy 4 added: global diff search when nothing else matches.
- * Diagnostic console logging.
+ * v1.4.0 — Runtime source instrumentation. When edit mode turns on, React
+ * fibers are walked and every editable element gets a data-wh-source attribute
+ * containing the exact file:line:col from React's _debugSource. Strategy 0 in
+ * the search cascade goes straight there — no global search needed for most
+ * edits. Position-aware file writes so we replace at the exact occurrence,
+ * even if the same text appears elsewhere in the file.
  * 
  * Requirements: Chrome/Edge (File System Access API)
  */
 ;(function () {
   'use strict'
 
-  const WEBHAUS_EDITOR_VERSION = '1.3.1'
+  const WEBHAUS_EDITOR_VERSION = '1.4.0'
 
   // Bail if already loaded
   if (window.__webhausEditor) {
@@ -748,6 +751,68 @@
   }
 
   // ---------------------------------------------------------------------------
+  // RUNTIME SOURCE INSTRUMENTATION
+  // ---------------------------------------------------------------------------
+  // When edit mode turns on, walk every tagged element and copy its React
+  // fiber's _debugSource (file + line + column) onto the DOM as a
+  // `data-wh-source="path/to/file.tsx:42:8"` attribute. Then at edit time
+  // we go straight to that exact file/line instead of searching the whole
+  // project. This is the single biggest reliability improvement available.
+  //
+  // For prop-passed text (where the element's own source is the COMPONENT
+  // not where the literal lives), we also store the owner's source as
+  // `data-wh-owner` so the search cascade has a second target to try.
+
+  function instrumentElementSources() {
+    let instrumented = 0
+    document.querySelectorAll('[data-wh-editable]').forEach(el => {
+      if (el.hasAttribute('data-wh-source')) return // already instrumented
+
+      const fiber = findReactFiber(el)
+      if (!fiber) return
+
+      // The element's own JSX location
+      if (fiber._debugSource && fiber._debugSource.fileName) {
+        const { fileName, lineNumber, columnNumber } = fiber._debugSource
+        const match = matchAbsToIndexed(fileName)
+        if (match) {
+          el.setAttribute('data-wh-source',
+            `${match.path}:${lineNumber || 0}:${columnNumber || 0}`)
+          instrumented++
+        }
+      }
+
+      // The component that rendered this element (for prop-passed text)
+      if (fiber._debugOwner && fiber._debugOwner._debugSource) {
+        const { fileName, lineNumber, columnNumber } = fiber._debugOwner._debugSource
+        const match = matchAbsToIndexed(fileName)
+        if (match) {
+          el.setAttribute('data-wh-owner',
+            `${match.path}:${lineNumber || 0}:${columnNumber || 0}`)
+        }
+      }
+    })
+    if (instrumented > 0) {
+      console.log(`[Webhaus Editor] Instrumented ${instrumented} elements with React source locations`)
+    }
+  }
+
+  /**
+   * Parse a "path:line:col" source attribute into its components.
+   */
+  function parseSourceAttr(value) {
+    if (!value) return null
+    const lastColon = value.lastIndexOf(':')
+    const secondLast = value.lastIndexOf(':', lastColon - 1)
+    if (secondLast === -1) return null
+    return {
+      path: value.substring(0, secondLast),
+      line: parseInt(value.substring(secondLast + 1, lastColon), 10) || 0,
+      col: parseInt(value.substring(lastColon + 1), 10) || 0
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // SEARCH
   // ---------------------------------------------------------------------------
 
@@ -850,12 +915,94 @@
   }
 
   /**
+   * Search ONE specific file for text, preferring occurrences near a hint line.
+   * Used when we have a data-wh-source attribute giving us the exact file and
+   * line where React said this element was rendered.
+   *
+   * Returns { path, handle, content, match, position, line, distance } or null.
+   */
+  function searchInFileNearLine(filePath, searchText, lineHint, lineWindow = 30) {
+    const entry = fileIndex.get(filePath)
+    if (!entry) return null
+
+    const trimmed = searchText.trim()
+    if (!trimmed) return null
+
+    const content = entry.content
+    const occurrences = []
+
+    // First try exact text matches
+    let idx = content.indexOf(trimmed)
+    while (idx !== -1) {
+      occurrences.push({ position: idx, match: trimmed })
+      idx = content.indexOf(trimmed, idx + 1)
+    }
+
+    // If no exact, try flexible-whitespace pattern (handles JSX line breaks)
+    if (occurrences.length === 0) {
+      const pattern = buildFlexiblePattern(trimmed)
+      if (pattern) {
+        let m
+        while ((m = pattern.exec(content)) !== null) {
+          occurrences.push({ position: m.index, match: m[0] })
+        }
+      }
+    }
+
+    if (occurrences.length === 0) return null
+
+    // Compute line numbers and distance from hint
+    const lineOf = (pos) => {
+      let line = 1
+      for (let i = 0; i < pos; i++) if (content.charCodeAt(i) === 10) line++
+      return line
+    }
+
+    if (lineHint) {
+      occurrences.forEach(o => {
+        o.line = lineOf(o.position)
+        o.distance = Math.abs(o.line - lineHint)
+      })
+      occurrences.sort((a, b) => a.distance - b.distance)
+
+      // Only return if the closest is within the window
+      if (occurrences[0].distance <= lineWindow) {
+        return {
+          path: filePath, handle: entry.handle, content,
+          match: occurrences[0].match,
+          position: occurrences[0].position,
+          line: occurrences[0].line,
+          distance: occurrences[0].distance,
+          occurrences: occurrences.length
+        }
+      }
+      return null
+    }
+
+    // No line hint — return first occurrence
+    return {
+      path: filePath, handle: entry.handle, content,
+      match: occurrences[0].match,
+      position: occurrences[0].position,
+      occurrences: occurrences.length
+    }
+  }
+
+  /**
    * Write updated content to a source file.
    * Re-reads the file fresh from disk first to avoid overwriting external changes
    * (e.g. if Claude Code or your editor modified the file between our index and write).
+   *
+   * Two modes:
+   *   - Default: replaces the FIRST occurrence of searchText in the file
+   *   - Position-aware (when `position` is a number): verifies the text at that
+   *     exact position and replaces at that exact spot. This is critical when
+   *     using data-wh-source — without it, we'd always replace the first match
+   *     in the file even if the React-identified occurrence was further down.
+   *
    * Returns { success, occurrences, freshContent } or { success: false, reason }
    */
-  async function writeFile(fileHandle, cachedContent, searchText, replaceText) {
+  async function writeFile(fileHandle, cachedContent, searchText, replaceText, position = null) {
     // Re-read fresh content from disk
     let freshContent
     try {
@@ -877,7 +1024,30 @@
       }
     }
 
-    const newContent = freshContent.replace(searchText, replaceText)
+    let newContent
+    if (typeof position === 'number') {
+      // Position-aware replacement: verify text is still at that exact position
+      const atPos = freshContent.substring(position, position + searchText.length)
+      if (atPos === searchText) {
+        newContent = freshContent.substring(0, position)
+          + replaceText
+          + freshContent.substring(position + searchText.length)
+      } else {
+        // File shifted (lines added/removed externally). Search within ±500 chars of expected position.
+        const windowStart = Math.max(0, position - 500)
+        const nearbyIdx = freshContent.indexOf(searchText, windowStart)
+        if (nearbyIdx === -1 || nearbyIdx > position + 500) {
+          return { success: false, reason: 'Text moved beyond recovery window' }
+        }
+        newContent = freshContent.substring(0, nearbyIdx)
+          + replaceText
+          + freshContent.substring(nearbyIdx + searchText.length)
+      }
+    } else {
+      // Default: replace first occurrence (string-based)
+      newContent = freshContent.replace(searchText, replaceText)
+    }
+
     if (newContent === freshContent) {
       return { success: false, reason: 'No changes detected' }
     }
@@ -1294,6 +1464,67 @@
       setElementState(el, state)
     }
 
+    // ---- Strategy 0: direct file:line edit using data-wh-source ----
+    // The element has data-wh-source set by React fiber instrumentation.
+    // Go straight to that file and find the text near that line — no global search.
+    const sourceAttr = el.getAttribute('data-wh-source')
+    const ownerAttr = el.getAttribute('data-wh-owner')
+    const sourceLocations = [sourceAttr, ownerAttr].filter(Boolean).map(parseSourceAttr).filter(Boolean)
+
+    if (sourceLocations.length > 0) {
+      console.log('[Webhaus Editor] Strategy 0 sources:', sourceLocations)
+
+      for (const loc of sourceLocations) {
+        // Try the full original text first
+        let scoped = searchInFileNearLine(loc.path, originalText.trim(), loc.line)
+        let usedDiff = false
+        let changedText = null
+        let replacementText = newText.trim()
+
+        // If the full text isn't there (prop-passed text → component file has no literal),
+        // try the diff-extracted changed portion
+        if (!scoped) {
+          const diffForScoped = diffTexts(originalText, newText)
+          if (diffForScoped.oldChanged) {
+            scoped = searchInFileNearLine(loc.path, diffForScoped.oldChanged, loc.line)
+            if (scoped) {
+              usedDiff = true
+              changedText = diffForScoped.oldChanged
+              replacementText = diffForScoped.newChanged
+            }
+          }
+        }
+
+        if (scoped) {
+          console.log('[Webhaus Editor] Strategy 0 matched in', scoped.path,
+            'line', scoped.line, '(distance', scoped.distance, ')')
+
+          try {
+            const result = await writeFile(
+              scoped.handle, scoped.content,
+              scoped.match, replacementText,
+              scoped.position // position-aware write — replaces at exact location
+            )
+            if (result.success) {
+              const logFrom = usedDiff ? changedText : scoped.match
+              logEdit(scoped.path, logFrom, replacementText, result.freshContent, scoped.handle)
+              const noteDetail = usedDiff
+                ? ` ("${changedText}" → "${replacementText}")`
+                : ''
+              toast(`Saved → ${scoped.path}:${scoped.line}${noteDetail}`, 'success')
+              return finalize('success')
+            } else {
+              console.warn('[Webhaus Editor] Strategy 0 write failed:', result.reason)
+            }
+          } catch (err) {
+            toast(`Write failed: ${err.message}`, 'error')
+            return finalize('error', true)
+          }
+        }
+      }
+      console.log('[Webhaus Editor] Strategy 0: no match in any sourced file, falling through')
+    }
+
     // ---- Strategy 1: full text search ----
     let results = searchFiles(originalText.trim())
     console.log('[Webhaus Editor] Strategy 1 (full text):', results.length, 'matches')
@@ -1473,6 +1704,8 @@
     // may have scheduled a deferred finishEditing that still needs to run.
     document.querySelectorAll('[data-wh-editable]').forEach(el => {
       el.removeAttribute('data-wh-editable')
+      el.removeAttribute('data-wh-source')
+      el.removeAttribute('data-wh-owner')
       if (el.hasAttribute('data-wh-was-managed')) {
         el.removeAttribute('contenteditable')
         el.removeAttribute('data-wh-was-managed')
@@ -1512,6 +1745,10 @@
       if (el.closest('#wh-toolbar, #wh-toast-container')) return
       el.setAttribute('data-wh-editable', 'image')
     })
+
+    // Now that everything is tagged, walk React fibers and stamp data-wh-source
+    // onto each element so finishEditing knows the exact file:line:col without searching.
+    instrumentElementSources()
   }
 
   /** Get only the direct text content of an element, not its children's text */
