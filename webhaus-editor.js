@@ -1,5 +1,5 @@
 /**
- * Webhaus Editor v1.3.0
+ * Webhaus Editor v1.3.1
  * 
  * On-canvas inline editor for vibe-coded sites.
  * Edit text and images directly on any localhost page.
@@ -8,15 +8,16 @@
  * Editing feels like Google Docs: single click positions cursor,
  * double-click selects word, drag selects range — all native browser behavior.
  *
- * v1.3.0 — React fiber source detection for finding text in variables,
- * props, and data files. Expanded file index (.json, .yaml, etc).
+ * v1.3.1 — React hints now follow import statements to find data files.
+ * Strategy 4 added: global diff search when nothing else matches.
+ * Diagnostic console logging.
  * 
  * Requirements: Chrome/Edge (File System Access API)
  */
 ;(function () {
   'use strict'
 
-  const WEBHAUS_EDITOR_VERSION = '1.3.0'
+  const WEBHAUS_EDITOR_VERSION = '1.3.1'
 
   // Bail if already loaded
   if (window.__webhausEditor) {
@@ -650,6 +651,102 @@
     return hints
   }
 
+  /**
+   * Extract import paths from a source file. Captures both
+   * `import x from "..."` and `import "..."` syntax.
+   * Returns an array of raw import path strings.
+   */
+  function extractImports(content) {
+    const imports = []
+    if (!content) return imports
+    // ES module imports
+    const importRegex = /import\s+(?:[\w*{}\s,$]+\s+from\s+)?["']([^"']+)["']/g
+    let m
+    while ((m = importRegex.exec(content)) !== null) {
+      imports.push(m[1])
+    }
+    // CommonJS requires
+    const requireRegex = /require\s*\(\s*["']([^"']+)["']\s*\)/g
+    while ((m = requireRegex.exec(content)) !== null) {
+      imports.push(m[1])
+    }
+    return imports
+  }
+
+  /**
+   * Find an indexed file matching a raw import path.
+   * Handles common Next.js/Vite path aliases (@/, ~/, src/) and relative paths.
+   * Returns { path, handle, content } or null.
+   */
+  function resolveImportToIndexed(importPath, fromPath) {
+    // Skip external npm packages (anything not starting with . / @/ ~ / src/)
+    if (!importPath.startsWith('.') &&
+        !importPath.startsWith('@/') &&
+        !importPath.startsWith('~/') &&
+        !importPath.startsWith('/') &&
+        !importPath.startsWith('src/')) {
+      return null
+    }
+
+    // Strip common path alias prefixes — we'll match by suffix instead
+    let stripped = importPath
+      .replace(/^@\//, '')
+      .replace(/^~\//, '')
+      .replace(/^\.\//, '')
+      .replace(/^\//, '')
+
+    // Strip any explicit extension so we can match the indexed file's ext
+    stripped = stripped.replace(/\.(ts|tsx|js|jsx|mjs|cjs|json|md|mdx|yaml|yml|toml|astro|vue|svelte)$/, '')
+
+    // Match candidates by path suffix. Prefer longest, most specific match.
+    let best = null
+    for (const [path, entry] of fileIndex) {
+      const cleanIndexed = path.replace(/\.(ts|tsx|js|jsx|mjs|cjs|json|md|mdx|yaml|yml|toml|astro|vue|svelte)$/, '')
+
+      // Direct file match: e.g. "lib/content/brake-repairs" matches "src/lib/content/brake-repairs.ts"
+      if (cleanIndexed === stripped || cleanIndexed.endsWith('/' + stripped)) {
+        if (!best || path.length > best.path.length) best = { path, ...entry }
+      }
+      // Index file match: e.g. "lib/content" matches "src/lib/content/index.ts"
+      else if (cleanIndexed.endsWith('/' + stripped + '/index') || cleanIndexed === stripped + '/index') {
+        if (!best || path.length > best.path.length) best = { path, ...entry }
+      }
+    }
+
+    return best
+  }
+
+  /**
+   * Expand React hint files by following their import statements.
+   * This is how we find DATA FILES — e.g. when a page imports content from
+   * "@/lib/content/brake-repairs", that file isn't in the React render chain
+   * (React doesn't track plain data imports as owners) but it's where the
+   * actual text lives. We follow imports recursively up to `depth` levels.
+   */
+  function expandHintsWithImports(hintFiles, depth = 2) {
+    const result = [...hintFiles]
+    const seen = new Set(hintFiles.map(h => h.path))
+
+    let current = hintFiles
+    for (let level = 0; level < depth; level++) {
+      const next = []
+      for (const hint of current) {
+        const imports = extractImports(hint.content)
+        for (const imp of imports) {
+          const resolved = resolveImportToIndexed(imp, hint.path)
+          if (resolved && !seen.has(resolved.path)) {
+            seen.add(resolved.path)
+            result.push(resolved)
+            next.push(resolved)
+          }
+        }
+      }
+      current = next
+      if (current.length === 0) break
+    }
+    return result
+  }
+
   // ---------------------------------------------------------------------------
   // SEARCH
   // ---------------------------------------------------------------------------
@@ -1153,10 +1250,25 @@
     const newText = el.innerText
 
     // Capture React fiber hints BEFORE we mutate any state. These tell us
-    // which source files React thinks rendered this element — used to
-    // disambiguate matches and as the safe scope for last-resort searches.
-    const hintFiles = getReactHintFiles(el)
+    // which source files React thinks rendered this element. We expand the
+    // hint scope to include files imported by those components (data files,
+    // content modules) — that's where text usually lives in vibe-coded sites.
+    const directHints = getReactHintFiles(el)
+    const hintFiles = expandHintsWithImports(directHints, 2)
     const hintPaths = hintFiles.map(h => h.path)
+
+    // ---- Diagnostic logging (open DevTools console to see) ----
+    console.groupCollapsed(
+      `%c[Webhaus Editor] Edit attempt`,
+      'color:#2563eb;font-weight:bold'
+    )
+    console.log('Element:', el)
+    console.log('Original text:', JSON.stringify(originalText))
+    console.log('New text:', JSON.stringify(newText))
+    console.log('Indexed files:', fileIndex.size)
+    console.log('React-detected source files:', directHints.map(h => h.path))
+    console.log('Expanded hint scope (with imports):', hintPaths)
+    console.groupEnd()
 
     // Clean up tracking attributes — but keep contentEditable since edit mode is still on
     el.removeAttribute('data-wh-editing')
@@ -1184,6 +1296,7 @@
 
     // ---- Strategy 1: full text search ----
     let results = searchFiles(originalText.trim())
+    console.log('[Webhaus Editor] Strategy 1 (full text):', results.length, 'matches')
     results = preferHints(results, hintPaths)
 
     if (results.length > 0) {
@@ -1216,14 +1329,17 @@
       }
     }
 
-    // ---- Strategy 2: context-aware diff search (spans, mixed content) ----
+    // ---- Strategy 2: context-aware diff search ----
     const diff = diffTexts(originalText, newText)
+    console.log('[Webhaus Editor] Diff:', diff)
 
     if (diff.oldChanged) {
       const contextPhrase = [diff.contextBefore, diff.oldChanged, diff.contextAfter]
         .filter(Boolean).join(' ')
+      console.log('[Webhaus Editor] Strategy 2 context phrase:', JSON.stringify(contextPhrase))
 
       let diffResults = searchFiles(contextPhrase)
+      console.log('[Webhaus Editor] Strategy 2 (context diff):', diffResults.length, 'matches')
       diffResults = preferHints(diffResults, hintPaths)
 
       if (diffResults.length > 0) {
@@ -1258,19 +1374,14 @@
       }
     }
 
-    // ---- Strategy 3: hint-scoped diff search (variables, props, data files) ----
-    // When text comes from a prop or variable, the full text/context may not
-    // appear together anywhere in source. But the changed word almost always
-    // exists as a literal string in one of the React-hinted files (the
-    // component that rendered the element OR its parent components OR the
-    // data file they import from).
-    //
-    // We restrict the search to hint files only — this is what makes it safe
-    // to search for a short string like "pay" without risking a wrong global
-    // match. Without hints, we skip this strategy.
+    // ---- Strategy 3: hint-scoped diff search ----
+    // The changed word almost always exists as a literal in one of the
+    // expanded hint files (components + their imported data files).
     if (hintFiles.length > 0 && diff.oldChanged) {
       const allMatches = searchFiles(diff.oldChanged)
       const hintMatches = allMatches.filter(r => hintPaths.includes(r.path))
+      console.log('[Webhaus Editor] Strategy 3 (hint-scoped diff):',
+        allMatches.length, 'global,', hintMatches.length, 'in hint scope')
 
       if (hintMatches.length > 0) {
         let target = hintMatches.length === 1
@@ -1299,9 +1410,55 @@
       }
     }
 
+    // ---- Strategy 4: global diff search (last resort, only if uniquely identifiable) ----
+    // No hints worked. As a last resort, search ALL files for the changed word.
+    // Only proceed if the changed text is found in exactly ONE file globally —
+    // otherwise it's too dangerous to guess.
+    if (diff.oldChanged) {
+      const globalMatches = searchFiles(diff.oldChanged)
+      console.log('[Webhaus Editor] Strategy 4 (global diff):', globalMatches.length, 'matches')
+
+      if (globalMatches.length === 1) {
+        const target = globalMatches[0]
+        try {
+          const result = await writeFile(
+            target.handle, target.content,
+            target.match, diff.newChanged
+          )
+          if (result.success) {
+            logEdit(target.path, diff.oldChanged, diff.newChanged, result.freshContent, target.handle)
+            toast(`Saved → ${target.path} (global match, "${diff.oldChanged}" → "${diff.newChanged}")`, 'success')
+            return finalize('success')
+          }
+        } catch (err) {
+          toast(`Write failed: ${err.message}`, 'error')
+          return finalize('error', true)
+        }
+      } else if (globalMatches.length > 1) {
+        // Multiple matches and no React hint to disambiguate.
+        // Show picker so user can choose.
+        const target = await pickFromResults(globalMatches, diff.oldChanged)
+        if (target) {
+          try {
+            const result = await writeFile(
+              target.handle, target.content,
+              target.match, diff.newChanged
+            )
+            if (result.success) {
+              logEdit(target.path, diff.oldChanged, diff.newChanged, result.freshContent, target.handle)
+              toast(`Saved → ${target.path} ("${diff.oldChanged}" → "${diff.newChanged}")`, 'success')
+              return finalize('success')
+            }
+          } catch (err) {
+            toast(`Write failed: ${err.message}`, 'error')
+            return finalize('error', true)
+          }
+        }
+      }
+    }
+
     // ---- All strategies failed ----
-    // Offer a Claude Code prompt so the user can still fix it quickly.
-    // Include hint files in the prompt for better targeting.
+    console.warn('[Webhaus Editor] All strategies failed. Text may be computed at runtime.')
     offerClaudePrompt(originalText, newText, hintFiles)
     finalize('error', true)
   }
